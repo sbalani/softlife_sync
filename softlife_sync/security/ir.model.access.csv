@@ -1,0 +1,3 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_softlife_sync_client_user,softlife.sync.client user,model_softlife_sync_client,softlife_machine.group_softlife_machine_user,1,1,1,1
+access_softlife_sync_client_admin,softlife.sync.client admin,model_softlife_sync_client,base.group_system,1,1,1,1

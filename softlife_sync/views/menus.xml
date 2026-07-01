@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <menuitem id="menu_softlife_sync"
+                  name="Platform Sync"
+                  parent="softlife_machine.menu_softlife_root"
+                  sequence="40"
+                  action="action_softlife_sync_now"/>
+    </data>
+</odoo>

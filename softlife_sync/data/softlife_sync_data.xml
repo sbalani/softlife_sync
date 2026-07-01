@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <record id="action_softlife_sync_now" model="ir.actions.server">
+            <field name="name">Sync from platform</field>
+            <field name="model_id" ref="model_softlife_sync_client"/>
+            <field name="state">code</field>
+            <field name="code"><![CDATA[
+msg = env['softlife.sync.client'].sudo().sync_all()
+action = {
+    'type': 'ir.actions.client',
+    'tag': 'display_notification',
+    'params': {'title': 'SoftLife Sync', 'message': msg, 'type': 'success', 'sticky': False},
+}
+]]></field>
+        </record>
+    </data>
+</odoo>

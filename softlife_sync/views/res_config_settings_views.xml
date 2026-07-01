@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <record id="res_config_settings_view_form_sync" model="ir.ui.view">
+            <field name="name">res.config.settings.form.softlife_sync</field>
+            <field name="model">res.config.settings</field>
+            <field name="inherit_id" ref="base.res_config_settings_view_form"/>
+            <field name="arch" type="xml">
+                <xpath expr="//form" position="inside">
+                    <app data-string="SoftLife Sync" string="SoftLife Sync" name="softlife_sync">
+                        <block title="Platform Connection" name="softlife_sync_conn">
+                            <setting id="softlife_url" string="Supabase URL">
+                                <field name="softlife_supabase_url"/>
+                            </setting>
+                            <setting id="softlife_key" string="Service Role Key">
+                                <field name="softlife_supabase_key"/>
+                            </setting>
+                            <setting id="softlife_partner" string="Default customer for orders">
+                                <field name="softlife_default_partner_id"/>
+                            </setting>
+                            <setting id="softlife_product" string="Default product for order lines">
+                                <field name="softlife_default_product_id"/>
+                            </setting>
+                            <setting id="softlife_last" string="Last sync">
+                                <field name="softlife_last_sync" readonly="1"/>
+                            </setting>
+                            <setting id="softlife_btn">
+                                <button name="action_sync_now" type="object"
+                                        string="Sync now" class="btn-primary"/>
+                            </setting>
+                        </block>
+                    </app>
+                </xpath>
+            </field>
+        </record>
+    </data>
+</odoo>
