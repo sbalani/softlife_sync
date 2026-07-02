@@ -23,6 +23,7 @@
                             </setting>
                             <setting id="softlife_last" string="Last sync">
                                 <field name="softlife_last_sync" readonly="1"/>
+                                <field name="softlife_last_sync_summary" readonly="1"/>
                             </setting>
                             <setting id="softlife_btn">
                                 <button name="action_sync_now" type="object"

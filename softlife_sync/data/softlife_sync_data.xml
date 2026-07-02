@@ -6,12 +6,8 @@
             <field name="model_id" ref="model_softlife_sync_client"/>
             <field name="state">code</field>
             <field name="code"><![CDATA[
-msg = env['softlife.sync.client'].sudo().sync_all()
-action = {
-    'type': 'ir.actions.client',
-    'tag': 'display_notification',
-    'params': {'title': 'SoftLife Sync', 'message': msg, 'type': 'success', 'sticky': False},
-}
+env['softlife.sync.client'].sudo().sync_all()
+action = {'type': 'ir.actions.client', 'tag': 'reload'}
 ]]></field>
         </record>
     </data>

@@ -21,12 +21,16 @@ class ResConfigSettings(models.TransientModel):
         help='Product used on the invoice line (provides the revenue account).',
     )
     softlife_last_sync = fields.Char(string='Last sync', compute='_compute_softlife_last_sync')
+    softlife_last_sync_summary = fields.Char(string='Last result', compute='_compute_softlife_last_sync')
 
     @api.depends('softlife_supabase_url')
     def _compute_softlife_last_sync(self):
-        last = self.env['ir.config_parameter'].sudo().get_param('softlife.sync.last_sync')
+        icp = self.env['ir.config_parameter'].sudo()
+        last = icp.get_param('softlife.sync.last_sync')
+        summary = icp.get_param('softlife.sync.last_sync_summary')
         for rec in self:
             rec.softlife_last_sync = last or ''
+            rec.softlife_last_sync_summary = summary or ''
 
     def action_sync_now(self):
         msg = self.env['softlife.sync.client'].sudo().sync_all()

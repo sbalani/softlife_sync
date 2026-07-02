@@ -191,13 +191,16 @@ class SoftlifeSyncClient(models.TransientModel):
             except Exception as e:
                 results[name] = f'error: {e}'
                 _logger.exception('softlife_sync %s failed', name)
-        self.env['ir.config_parameter'].sudo().set_param('softlife.sync.last_sync', fields.Datetime.now())
-        return (
+        msg = (
             f"Synced {results.get('partners', 0)} customer(s), "
             f"{results.get('products', 0)} product(s), "
             f"{results.get('machines', 0)} machine(s), "
             f"{results.get('orders', 0)} order(s)."
         )
+        icp = self.env['ir.config_parameter'].sudo()
+        icp.set_param('softlife.sync.last_sync', fields.Datetime.now())
+        icp.set_param('softlife.sync.last_sync_summary', msg)
+        return msg
 
     @api.model
     def _cron_sync(self):
