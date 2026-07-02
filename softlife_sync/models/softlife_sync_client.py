@@ -80,6 +80,38 @@ class SoftlifeSyncClient(models.TransientModel):
         return n
 
     @api.model
+    def sync_machines(self):
+        rows = self._rest_get('machines', {
+            'select': 'id,name,ref,device_imei,device_id_huaxin,state,customer_id',
+        })
+        Machine = self.env['softlife.machine']
+        Partner = self.env['res.partner']
+        n = 0
+        for row in rows:
+            imei = row.get('device_imei')
+            if not imei:
+                continue
+            vals = {
+                'name': row.get('name') or imei,
+                'ref': row.get('ref'),
+                'device_imei': imei,
+                'device_id_huaxin': row.get('device_id_huaxin'),
+                'state': row.get('state') or 'active',
+            }
+            cust = row.get('customer_id')
+            if cust:
+                partner = Partner.search([('supabase_id', '=', cust)], limit=1)
+                if partner:
+                    vals['partner_id'] = partner.id
+            existing = Machine.search([('device_imei', '=', imei)], limit=1)
+            if existing:
+                existing.write(vals)
+            else:
+                Machine.create(vals)
+            n += 1
+        return n
+
+    @api.model
     def sync_orders(self):
         icp = self.env['ir.config_parameter'].sudo()
         since = icp.get_param('softlife.sync.orders_since') or ''
@@ -152,6 +184,7 @@ class SoftlifeSyncClient(models.TransientModel):
         results = {}
         for name, fn in (('partners', self.sync_partners),
                          ('products', self.sync_products),
+                         ('machines', self.sync_machines),
                          ('orders', self.sync_orders)):
             try:
                 results[name] = fn()
@@ -162,6 +195,7 @@ class SoftlifeSyncClient(models.TransientModel):
         return (
             f"Synced {results.get('partners', 0)} customer(s), "
             f"{results.get('products', 0)} product(s), "
+            f"{results.get('machines', 0)} machine(s), "
             f"{results.get('orders', 0)} order(s)."
         )
 

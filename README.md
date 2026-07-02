@@ -10,6 +10,7 @@ data Odoo needs for accounting / **Spanish VeriFactu**:
 |---|---|
 | `tenants` | `res.partner` (customers) |
 | `products` | `product.template` |
+| `machines` | `softlife.machine` (matched by IMEI; customer linked) |
 | `huaxin_orders` | `account.move` — draft customer invoices (→ VeriFactu) |
 
 Odoo **no longer talks to Huaxin directly**; `softlife_huaxin` is retired.
