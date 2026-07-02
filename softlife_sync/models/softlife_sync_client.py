@@ -103,13 +103,53 @@ class SoftlifeSyncClient(models.TransientModel):
                 partner = Partner.search([('supabase_id', '=', cust)], limit=1)
                 if partner:
                     vals['partner_id'] = partner.id
-            existing = Machine.search([('device_imei', '=', imei)], limit=1)
-            if existing:
-                existing.write(vals)
+            machine = Machine.search([('device_imei', '=', imei)], limit=1)
+            if machine:
+                machine.write(vals)
             else:
-                Machine.create(vals)
+                machine = Machine.create(vals)
+
+            # Hoppers / ingredients (positions: solid_1..3, liquid_1..3)
+            try:
+                ing_rows = self._rest_get('machine_ingredients', {
+                    'select': 'position,product_id,product_type,enabled',
+                    'machine_id': f'eq.{row.get("id")}',
+                })
+                self._apply_ingredients(machine, ing_rows)
+            except Exception as e:
+                _logger.warning('softlife_sync ingredients for %s: %s', imei, e)
             n += 1
         return n
+
+    @api.model
+    def _apply_ingredients(self, machine, ing_rows):
+        """Merge Supabase hopper config into Odoo ingredient lines by position
+        (preserves portion size / cycled on existing lines; Supabase is source of truth)."""
+        Template = self.env['product.template']
+        pos_to_line = {ln.position: ln for ln in machine.ingredient_line_ids}
+        desired = set()
+        for row in ing_rows:
+            pos = row.get('position')
+            if not pos:
+                continue
+            desired.add(pos)
+            vals = {
+                'position': pos,
+                'product_type': row.get('product_type') or 'topping',
+                'enabled': bool(row.get('enabled', True)),
+            }
+            pid = row.get('product_id')
+            if pid:
+                tmpl = Template.search([('supabase_id', '=', pid)], limit=1)
+                if tmpl and tmpl.product_variant_id:
+                    vals['product_id'] = tmpl.product_variant_id.id
+            if pos in pos_to_line:
+                pos_to_line[pos].write(vals)
+            else:
+                machine.write({'ingredient_line_ids': [(0, 0, vals)]})
+        for pos, ln in pos_to_line.items():
+            if pos not in desired:
+                ln.unlink()
 
     @api.model
     def sync_orders(self):
