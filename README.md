@@ -2,8 +2,8 @@
 
 Custom **Odoo 18** module — downstream ERP connector for the SoftLife platform.
 
-The **middleware** (Supabase + Vercel) is the system of record (machines,
-franchisees, products, orders, telemetry). This module reads it and mirrors the
+The **middleware** (Supabase + Vercel) is the system of record for machines,
+franchisees, orders and telemetry. This module reads it and mirrors the
 data Odoo needs for accounting / **Spanish VeriFactu**:
 
 | Platform (Supabase) | → Odoo |
@@ -12,6 +12,21 @@ data Odoo needs for accounting / **Spanish VeriFactu**:
 | `products` | `product.template` |
 | `machines` | `softlife.machine` (matched by IMEI; customer linked) |
 | `huaxin_orders` | `account.move` — draft customer invoices (→ VeriFactu) |
+
+For SKUs, lots and warehouses, **Odoo is the system of record** instead — it
+already owns real stock/traceability data. This module mirrors that data back
+out so the platform can read it, closing the loop:
+
+| Odoo | → Platform (Supabase) |
+|---|---|
+| `product.product` | `odoo_products` |
+| `stock.lot` | `odoo_lots` |
+| `stock.warehouse` | `odoo_warehouses` |
+
+New products created on the platform (`products.odoo_id is null`) are created
+in Odoo by `sync_products`, which then writes the resulting Odoo id back onto
+the Supabase row — so `products.odoo_id` always points at the matching
+`odoo_products.odoo_id` once a sync has run, in either direction.
 
 Odoo **no longer talks to Huaxin directly**; `softlife_huaxin` is retired.
 
@@ -35,5 +50,5 @@ git clone https://github.com/sbalani/softlife_sync.git softlife_sync
 (requires `softlife_machine` and `account`).
 
 ## Depends on
-`softlife_machine`, `account` (product comes transitively). Add OCA
+`softlife_machine`, `account`, `stock` (product comes transitively). Add OCA
 `l10n_es_*` VeriFactu modules for the fiscal submission itself.

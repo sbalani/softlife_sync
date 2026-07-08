@@ -12,15 +12,25 @@ system of record operated by the middleware) and mirrors into Odoo:
   products       -> product.template
   huaxin_orders  -> account.move (draft customer invoices -> feeds VeriFactu)
 
+...and mirrors Odoo's own SKU/lot/warehouse master data back out to Supabase
+(read-only mirror tables the platform consumes — see softlife-platform/README):
+
+  product.product   -> odoo_products
+  stock.lot          -> odoo_lots
+  stock.warehouse     -> odoo_warehouses
+
+New platform products (odoo_id null) are created in Odoo and the resulting id
+is written back to Supabase, closing the loop.
+
 Odoo no longer talks to Huaxin directly — the middleware owns Huaxin.
-Idempotent by Supabase id / order code. Run via Settings, the "Platform Sync"
-menu, or an hourly cron.
+Idempotent by Supabase id / order code / odoo_id. Run via Settings, the
+"Platform Sync" menu, or an hourly cron.
 """,
     'author': 'SoftLife',
     'website': 'https://softlife.es',
     'category': 'Accounting/Accounting',
     'license': 'OPL-1',
-    'depends': ['softlife_machine', 'account'],
+    'depends': ['softlife_machine', 'account', 'stock'],
     'data': [
         'security/ir.model.access.csv',
         'data/softlife_sync_data.xml',

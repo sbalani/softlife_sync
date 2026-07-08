@@ -40,6 +40,43 @@ class SoftlifeSyncClient(models.TransientModel):
             raise UserError(_('Supabase GET %s failed: %s %s') % (table, r.status_code, r.text[:200]))
         return r.json()
 
+    @api.model
+    def _rest_upsert(self, table, rows, on_conflict):
+        """Bulk upsert rows into a Supabase table, keyed on `on_conflict` (a column name)."""
+        import requests
+        if not rows:
+            return
+        base = self._param('softlife.sync.supabase_url').rstrip('/')
+        key = self._param('softlife.sync.supabase_key')
+        url = f'{base}/rest/v1/{table}'
+        headers = {
+            'apikey': key,
+            'Authorization': f'Bearer {key}',
+            'Content-Type': 'application/json',
+            'Prefer': 'resolution=merge-duplicates,return=minimal',
+        }
+        r = requests.post(url, headers=headers, params={'on_conflict': on_conflict}, json=rows, timeout=60)
+        if r.status_code not in (200, 201, 204):
+            raise UserError(_('Supabase upsert %s failed: %s %s') % (table, r.status_code, r.text[:200]))
+
+    @api.model
+    def _rest_patch(self, table, match, vals):
+        """Patch rows in a Supabase table matching `match` (dict of column -> value, combined with eq/AND)."""
+        import requests
+        base = self._param('softlife.sync.supabase_url').rstrip('/')
+        key = self._param('softlife.sync.supabase_key')
+        url = f'{base}/rest/v1/{table}'
+        headers = {
+            'apikey': key,
+            'Authorization': f'Bearer {key}',
+            'Content-Type': 'application/json',
+            'Prefer': 'return=minimal',
+        }
+        params = {k: f'eq.{v}' for k, v in match.items()}
+        r = requests.patch(url, headers=headers, params=params, json=vals, timeout=60)
+        if r.status_code not in (200, 204):
+            raise UserError(_('Supabase patch %s failed: %s %s') % (table, r.status_code, r.text[:200]))
+
     # ------------------------------------------------------------------
     # Sync
     # ------------------------------------------------------------------
@@ -63,7 +100,10 @@ class SoftlifeSyncClient(models.TransientModel):
 
     @api.model
     def sync_products(self):
-        rows = self._rest_get('products', {'select': 'id,name,type'})
+        """Platform -> Odoo. Creates/updates product.template by supabase_id,
+        then writes the Odoo product id back onto the Supabase row (products.odoo_id)
+        so the platform knows the push landed and can link against odoo_products."""
+        rows = self._rest_get('products', {'select': 'id,name,type,odoo_id'})
         Template = self.env['product.template']
         n = 0
         for row in rows:
@@ -74,10 +114,71 @@ class SoftlifeSyncClient(models.TransientModel):
             existing = Template.search([('supabase_id', '=', sid)], limit=1)
             if existing:
                 existing.write(vals)
+                tmpl = existing
             else:
-                Template.create(vals)
+                tmpl = Template.create(vals)
             n += 1
+            variant = tmpl.product_variant_id
+            if variant and row.get('odoo_id') != variant.id:
+                try:
+                    self._rest_patch('products', {'id': sid}, {'odoo_id': variant.id})
+                except Exception as e:
+                    _logger.warning('softlife_sync: failed to link back odoo_id for product %s: %s', sid, e)
         return n
+
+    # ------------------------------------------------------------------
+    # Odoo -> Supabase (master-data mirror the platform reads)
+    # ------------------------------------------------------------------
+    @api.model
+    def sync_odoo_warehouses(self):
+        Warehouse = self.env['stock.warehouse']
+        rows = [
+            {'odoo_id': w.id, 'name': w.name, 'code': w.code}
+            for w in Warehouse.search([])
+        ]
+        self._rest_upsert('odoo_warehouses', rows, on_conflict='odoo_id')
+        return len(rows)
+
+    @api.model
+    def sync_odoo_products(self):
+        Product = self.env['product.product']
+        rows = []
+        for p in Product.search([('active', '=', True)]):
+            rows.append({
+                'odoo_id': p.id,
+                'name': p.display_name,
+                'sku': p.default_code or None,
+                'barcode': p.barcode or None,
+                'category': p.categ_id.display_name if p.categ_id else None,
+                'uom': p.uom_id.name if p.uom_id else None,
+                'qty_available': p.qty_available,
+            })
+        self._rest_upsert('odoo_products', rows, on_conflict='odoo_id')
+        return len(rows)
+
+    @api.model
+    def sync_odoo_lots(self):
+        # lot.location_id / product_qty are Odoo's own computed snapshot of where
+        # a lot currently sits and how much remains (aggregated across quants).
+        # A lot split across multiple locations collapses to one row here —
+        # fine for a "what lots exist and roughly where" mirror, not for
+        # location-level stock accounting.
+        Lot = self.env['stock.lot']
+        rows = []
+        for lot in Lot.search([]):
+            warehouse = lot.location_id.warehouse_id if lot.location_id else None
+            rows.append({
+                'odoo_id': lot.id,
+                'name': lot.name,
+                'odoo_product_id': lot.product_id.id or None,
+                'product_name': lot.product_id.display_name if lot.product_id else None,
+                'qty': lot.product_qty,
+                'expiration_date': lot.expiration_date.date().isoformat() if lot.expiration_date else None,
+                'odoo_warehouse_id': warehouse.id if warehouse else None,
+                'warehouse_name': warehouse.name if warehouse else None,
+            })
+        self._rest_upsert('odoo_lots', rows, on_conflict='odoo_id')
+        return len(rows)
 
     @api.model
     def sync_machines(self):
@@ -225,7 +326,10 @@ class SoftlifeSyncClient(models.TransientModel):
         for name, fn in (('partners', self.sync_partners),
                          ('products', self.sync_products),
                          ('machines', self.sync_machines),
-                         ('orders', self.sync_orders)):
+                         ('orders', self.sync_orders),
+                         ('odoo_warehouses', self.sync_odoo_warehouses),
+                         ('odoo_products', self.sync_odoo_products),
+                         ('odoo_lots', self.sync_odoo_lots)):
             try:
                 results[name] = fn()
             except Exception as e:
@@ -235,7 +339,10 @@ class SoftlifeSyncClient(models.TransientModel):
             f"Synced {results.get('partners', 0)} customer(s), "
             f"{results.get('products', 0)} product(s), "
             f"{results.get('machines', 0)} machine(s), "
-            f"{results.get('orders', 0)} order(s)."
+            f"{results.get('orders', 0)} order(s); "
+            f"mirrored {results.get('odoo_products', 0)} Odoo SKU(s), "
+            f"{results.get('odoo_lots', 0)} lot(s), "
+            f"{results.get('odoo_warehouses', 0)} warehouse(s) to Supabase."
         )
         icp = self.env['ir.config_parameter'].sudo()
         icp.set_param('softlife.sync.last_sync', fields.Datetime.now())
