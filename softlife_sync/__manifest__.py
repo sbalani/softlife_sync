@@ -19,8 +19,11 @@ system of record operated by the middleware) and mirrors into Odoo:
   stock.lot          -> odoo_lots
   stock.warehouse     -> odoo_warehouses
 
-New platform products (odoo_id null) are created in Odoo and the resulting id
-is written back to Supabase, closing the loop.
+Linking a platform ingredient to an Odoo SKU (products.odoo_id) is never done
+by this module automatically — it's a deliberate choice made on the platform
+(see /odoo and /products there). Records removed/archived in Odoo are pruned
+from the mirror tables on the next sync; any ingredient linked to a pruned
+row is automatically unlinked (FK is ON DELETE SET NULL), never re-pointed.
 
 Odoo no longer talks to Huaxin directly — the middleware owns Huaxin.
 Idempotent by Supabase id / order code / odoo_id. Run via Settings, the

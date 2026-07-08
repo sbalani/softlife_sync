@@ -23,10 +23,20 @@ out so the platform can read it, closing the loop:
 | `stock.lot` | `odoo_lots` |
 | `stock.warehouse` | `odoo_warehouses` |
 
-New products created on the platform (`products.odoo_id is null`) are created
-in Odoo by `sync_products`, which then writes the resulting Odoo id back onto
-the Supabase row — so `products.odoo_id` always points at the matching
-`odoo_products.odoo_id` once a sync has run, in either direction.
+`sync_products` still pushes every platform ingredient to Odoo as a
+`product.template` (matched idempotently by a `supabase_id` stamp) — but it
+**never writes `products.odoo_id`**. Linking an ingredient to a specific Odoo
+SKU is always a deliberate action taken on the platform (`/odoo` or
+`/products`), never inferred by name. An earlier version of this auto-linked
+by writing back the id of whatever product it had just pushed/matched — which
+silently created a duplicate Odoo product for an ingredient that already had
+a real match under a different id, and linked to the wrong one. Don't repeat
+that mistake if you touch this file again.
+
+Records deleted/archived in Odoo are pruned from the mirror tables on the
+next sync. If a platform ingredient was linked to a pruned record, the link
+is automatically cleared (`products.odoo_id` has `ON DELETE SET NULL`) — it's
+never silently re-pointed at something else.
 
 Odoo **no longer talks to Huaxin directly**; `softlife_huaxin` is retired.
 

@@ -60,22 +60,21 @@ class SoftlifeSyncClient(models.TransientModel):
             raise UserError(_('Supabase upsert %s failed: %s %s') % (table, r.status_code, r.text[:200]))
 
     @api.model
-    def _rest_patch(self, table, match, vals):
-        """Patch rows in a Supabase table matching `match` (dict of column -> value, combined with eq/AND)."""
+    def _rest_delete_missing(self, table, id_column, present_ids):
+        """Delete rows from a Supabase table whose id_column isn't in present_ids —
+        i.e. records removed/archived on the Odoo side since the last sync.
+        No-ops on an empty present_ids so a transient empty read can't wipe the table."""
         import requests
+        if not present_ids:
+            return
         base = self._param('softlife.sync.supabase_url').rstrip('/')
         key = self._param('softlife.sync.supabase_key')
         url = f'{base}/rest/v1/{table}'
-        headers = {
-            'apikey': key,
-            'Authorization': f'Bearer {key}',
-            'Content-Type': 'application/json',
-            'Prefer': 'return=minimal',
-        }
-        params = {k: f'eq.{v}' for k, v in match.items()}
-        r = requests.patch(url, headers=headers, params=params, json=vals, timeout=60)
+        headers = {'apikey': key, 'Authorization': f'Bearer {key}', 'Prefer': 'return=minimal'}
+        ids_csv = ','.join(str(i) for i in present_ids)
+        r = requests.delete(url, headers=headers, params={id_column: f'not.in.({ids_csv})'}, timeout=60)
         if r.status_code not in (200, 204):
-            raise UserError(_('Supabase patch %s failed: %s %s') % (table, r.status_code, r.text[:200]))
+            raise UserError(_('Supabase delete-missing %s failed: %s %s') % (table, r.status_code, r.text[:200]))
 
     # ------------------------------------------------------------------
     # Sync
@@ -100,10 +99,16 @@ class SoftlifeSyncClient(models.TransientModel):
 
     @api.model
     def sync_products(self):
-        """Platform -> Odoo. Creates/updates product.template by supabase_id,
-        then writes the Odoo product id back onto the Supabase row (products.odoo_id)
-        so the platform knows the push landed and can link against odoo_products."""
-        rows = self._rest_get('products', {'select': 'id,name,type,odoo_id'})
+        """Platform -> Odoo. Creates/updates product.template by supabase_id.
+        Does NOT touch products.odoo_id — linking a platform ingredient to an
+        Odoo SKU is a deliberate choice made on the platform (see /odoo and
+        /products), never inferred automatically. An earlier version of this
+        method auto-linked by writing back the newly-created product's id,
+        which silently created duplicate Odoo products for ingredients that
+        already had a real match under a different id (matched by name only
+        in the human's head, not by any field this code could see) and linked
+        to the wrong one. Don't repeat that."""
+        rows = self._rest_get('products', {'select': 'id,name,type'})
         Template = self.env['product.template']
         n = 0
         for row in rows:
@@ -114,16 +119,9 @@ class SoftlifeSyncClient(models.TransientModel):
             existing = Template.search([('supabase_id', '=', sid)], limit=1)
             if existing:
                 existing.write(vals)
-                tmpl = existing
             else:
-                tmpl = Template.create(vals)
+                Template.create(vals)
             n += 1
-            variant = tmpl.product_variant_id
-            if variant and row.get('odoo_id') != variant.id:
-                try:
-                    self._rest_patch('products', {'id': sid}, {'odoo_id': variant.id})
-                except Exception as e:
-                    _logger.warning('softlife_sync: failed to link back odoo_id for product %s: %s', sid, e)
         return n
 
     # ------------------------------------------------------------------
@@ -137,6 +135,7 @@ class SoftlifeSyncClient(models.TransientModel):
             for w in Warehouse.search([])
         ]
         self._rest_upsert('odoo_warehouses', rows, on_conflict='odoo_id')
+        self._rest_delete_missing('odoo_warehouses', 'odoo_id', [r['odoo_id'] for r in rows])
         return len(rows)
 
     @api.model
@@ -154,6 +153,10 @@ class SoftlifeSyncClient(models.TransientModel):
                 'qty_available': p.qty_available,
             })
         self._rest_upsert('odoo_products', rows, on_conflict='odoo_id')
+        # Deleted/archived in Odoo -> drop from the mirror. Any platform ingredient
+        # linked to it (products.odoo_id) is auto-unlinked (FK is ON DELETE SET NULL),
+        # never silently re-pointed at something else.
+        self._rest_delete_missing('odoo_products', 'odoo_id', [r['odoo_id'] for r in rows])
         return len(rows)
 
     @api.model
@@ -178,6 +181,7 @@ class SoftlifeSyncClient(models.TransientModel):
                 'warehouse_name': warehouse.name if warehouse else None,
             })
         self._rest_upsert('odoo_lots', rows, on_conflict='odoo_id')
+        self._rest_delete_missing('odoo_lots', 'odoo_id', [r['odoo_id'] for r in rows])
         return len(rows)
 
     @api.model
