@@ -76,6 +76,19 @@ class SoftlifeSyncClient(models.TransientModel):
         if r.status_code not in (200, 204):
             raise UserError(_('Supabase delete-missing %s failed: %s %s') % (table, r.status_code, r.text[:200]))
 
+    @api.model
+    def _rest_rpc(self, function, payload):
+        import requests
+        base = self._param('softlife.sync.supabase_url').rstrip('/')
+        key = self._param('softlife.sync.supabase_key')
+        r = requests.post(
+            f'{base}/rest/v1/rpc/{function}',
+            headers={'apikey': key, 'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+            json=payload, timeout=60,
+        )
+        if r.status_code not in (200, 201, 204):
+            raise UserError(_('Supabase RPC %s failed: %s %s') % (function, r.status_code, r.text[:200]))
+
     # ------------------------------------------------------------------
     # Sync
     # ------------------------------------------------------------------
@@ -182,6 +195,26 @@ class SoftlifeSyncClient(models.TransientModel):
             })
         self._rest_upsert('odoo_lots', rows, on_conflict='odoo_id')
         self._rest_delete_missing('odoo_lots', 'odoo_id', [r['odoo_id'] for r in rows])
+        return len(rows)
+
+    @api.model
+    def sync_odoo_lot_stock(self):
+        quantities = {}
+        for quant in self.env['stock.quant'].search([
+            ('lot_id', '!=', False),
+            ('location_id.usage', '=', 'internal'),
+        ]):
+            warehouse = quant.location_id.warehouse_id
+            if not warehouse:
+                continue
+            key = (quant.lot_id.id, warehouse.id)
+            quantities[key] = quantities.get(key, 0.0) + quant.quantity
+        rows = [{
+            'odoo_lot_id': lot_id,
+            'odoo_warehouse_id': warehouse_id,
+            'qty': quantity,
+        } for (lot_id, warehouse_id), quantity in quantities.items() if quantity > 0]
+        self._rest_rpc('replace_odoo_lot_stock', {'p_rows': rows})
         return len(rows)
 
     @api.model
@@ -341,7 +374,8 @@ class SoftlifeSyncClient(models.TransientModel):
                          ('orders', self.sync_orders),
                          ('odoo_warehouses', self.sync_odoo_warehouses),
                          ('odoo_products', self.sync_odoo_products),
-                         ('odoo_lots', self.sync_odoo_lots)):
+                         ('odoo_lots', self.sync_odoo_lots),
+                         ('odoo_lot_stock', self.sync_odoo_lot_stock)):
             try:
                 with self.env.cr.savepoint():
                     result = fn()
@@ -364,6 +398,7 @@ class SoftlifeSyncClient(models.TransientModel):
             f"{count('orders')} order(s); "
             f"mirrored {count('odoo_products')} Odoo SKU(s), "
             f"{count('odoo_lots')} lot(s), "
+            f"{count('odoo_lot_stock')} warehouse lot balance(s), "
             f"{count('odoo_warehouses')} warehouse(s) to Supabase."
         )
         if errors:

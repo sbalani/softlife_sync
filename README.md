@@ -22,6 +22,7 @@ out so the platform can read it, closing the loop:
 | `product.product` | `odoo_products` |
 | `stock.lot` | `odoo_lots` |
 | `stock.warehouse` | `odoo_warehouses` |
+| positive internal `stock.quant` by lot/warehouse | `odoo_lot_stock` |
 
 `sync_products` still pushes every platform ingredient to Odoo as a
 `product.template` (matched idempotently by a `supabase_id` stamp) — but it

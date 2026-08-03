@@ -1,6 +1,6 @@
 {
     'name': 'SoftLife Platform Sync',
-    'version': '18.0.1.0.1',
+    'version': '18.0.1.0.2',
     'summary': 'Pull operational data (customers, products, orders -> invoices) from the SoftLife platform (Supabase) into Odoo.',
     'description': """
 SoftLife Platform Sync
@@ -18,6 +18,7 @@ system of record operated by the middleware) and mirrors into Odoo:
   product.product   -> odoo_products
   stock.lot          -> odoo_lots
   stock.warehouse     -> odoo_warehouses
+  stock.quant         -> odoo_lot_stock (lot quantity per warehouse)
 
 Linking a platform ingredient to an Odoo SKU (products.odoo_id) is never done
 by this module automatically — it's a deliberate choice made on the platform
