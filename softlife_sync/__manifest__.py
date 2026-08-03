@@ -1,6 +1,6 @@
 {
     'name': 'SoftLife Platform Sync',
-    'version': '18.0.1.0.0',
+    'version': '18.0.1.0.1',
     'summary': 'Pull operational data (customers, products, orders -> invoices) from the SoftLife platform (Supabase) into Odoo.',
     'description': """
 SoftLife Platform Sync

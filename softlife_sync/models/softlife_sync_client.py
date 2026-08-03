@@ -192,6 +192,7 @@ class SoftlifeSyncClient(models.TransientModel):
         Machine = self.env['softlife.machine']
         Partner = self.env['res.partner']
         n = 0
+        warnings = []
         for row in rows:
             imei = row.get('device_imei')
             if not imei:
@@ -216,15 +217,17 @@ class SoftlifeSyncClient(models.TransientModel):
 
             # Hoppers / ingredients (positions: solid_1..3, liquid_1..3)
             try:
-                ing_rows = self._rest_get('machine_ingredients', {
-                    'select': 'position,product_id,product_type,enabled',
-                    'machine_id': f'eq.{row.get("id")}',
-                })
-                self._apply_ingredients(machine, ing_rows)
+                with self.env.cr.savepoint():
+                    ing_rows = self._rest_get('machine_ingredients', {
+                        'select': 'position,product_id,product_type,enabled',
+                        'machine_id': f'eq.{row.get("id")}',
+                    })
+                    self._apply_ingredients(machine, ing_rows)
             except Exception as e:
+                warnings.append(f'{imei} ingredients: {e}')
                 _logger.warning('softlife_sync ingredients for %s: %s', imei, e)
             n += 1
-        return n
+        return (n, warnings) if warnings else n
 
     @api.model
     def _apply_ingredients(self, machine, ing_rows):
@@ -284,13 +287,17 @@ class SoftlifeSyncClient(models.TransientModel):
 
         n = 0
         max_ts = since
+        warnings = []
         for row in rows:
             code = row.get('order_code')
+            ts = row.get('order_time') or ''
+            if ts and ts > max_ts:
+                max_ts = ts
             if not code:
+                warnings.append(f'order at {ts or "unknown time"}: missing order code')
                 continue
             if Move.search([('supabase_order_code', '=', code)], limit=1):
                 continue
-            ts = row.get('order_time') or ''
             try:
                 inv_date = (
                     fields.Date.to_date(datetime.datetime.fromisoformat(ts.replace('Z', '+00:00')).date())
@@ -299,34 +306,35 @@ class SoftlifeSyncClient(models.TransientModel):
             except Exception:
                 inv_date = fields.Date.today()
             try:
-                Move.create({
-                    'move_type': 'out_invoice',
-                    'partner_id': partner.id,
-                    'invoice_date': inv_date,
-                    'supabase_order_code': code,
-                    'invoice_line_ids': [(0, 0, {
-                        'product_id': product.id,
-                        'name': row.get('product_name') or product.name,
-                        'quantity': 1,
-                        'price_unit': float(row.get('price') or 0.0),
-                        'account_id': income_account.id if income_account else False,
-                    })],
-                })
+                with self.env.cr.savepoint():
+                    Move.create({
+                        'move_type': 'out_invoice',
+                        'partner_id': partner.id,
+                        'invoice_date': inv_date,
+                        'supabase_order_code': code,
+                        'invoice_line_ids': [(0, 0, {
+                            'product_id': product.id,
+                            'name': row.get('product_name') or product.name,
+                            'quantity': 1,
+                            'price_unit': float(row.get('price') or 0.0),
+                            'account_id': income_account.id if income_account else False,
+                        })],
+                    })
                 n += 1
-                if ts and ts > max_ts:
-                    max_ts = ts
             except Exception as e:
+                warnings.append(f'order {code}: {e}')
                 _logger.warning('softlife_sync: failed order %s: %s', code, e)
 
-        if max_ts and max_ts != since:
+        if not warnings and max_ts and max_ts != since:
             icp.set_param('softlife.sync.orders_since', max_ts)
-        return n
+        return (n, warnings) if warnings else n
 
     @api.model
     def sync_all(self):
         if not self._is_configured():
             return 'Skipped: Supabase URL / key not configured.'
         results = {}
+        errors = []
         for name, fn in (('partners', self.sync_partners),
                          ('products', self.sync_products),
                          ('machines', self.sync_machines),
@@ -335,19 +343,34 @@ class SoftlifeSyncClient(models.TransientModel):
                          ('odoo_products', self.sync_odoo_products),
                          ('odoo_lots', self.sync_odoo_lots)):
             try:
-                results[name] = fn()
+                with self.env.cr.savepoint():
+                    result = fn()
+                    if isinstance(result, tuple):
+                        results[name] = result[0]
+                        errors.extend(f'{name}: {warning}' for warning in result[1])
+                    else:
+                        results[name] = result
             except Exception as e:
-                results[name] = f'error: {e}'
+                results[name] = 0
+                errors.append(f'{name}: {e}')
                 _logger.exception('softlife_sync %s failed', name)
+        def count(name):
+            result = results.get(name, 0)
+            return result if isinstance(result, int) else 0
         msg = (
-            f"Synced {results.get('partners', 0)} customer(s), "
-            f"{results.get('products', 0)} product(s), "
-            f"{results.get('machines', 0)} machine(s), "
-            f"{results.get('orders', 0)} order(s); "
-            f"mirrored {results.get('odoo_products', 0)} Odoo SKU(s), "
-            f"{results.get('odoo_lots', 0)} lot(s), "
-            f"{results.get('odoo_warehouses', 0)} warehouse(s) to Supabase."
+            f"Synced {count('partners')} customer(s), "
+            f"{count('products')} product(s), "
+            f"{count('machines')} machine(s), "
+            f"{count('orders')} order(s); "
+            f"mirrored {count('odoo_products')} Odoo SKU(s), "
+            f"{count('odoo_lots')} lot(s), "
+            f"{count('odoo_warehouses')} warehouse(s) to Supabase."
         )
+        if errors:
+            shown = errors[:10]
+            if len(errors) > len(shown):
+                shown.append(f'{len(errors) - len(shown)} more error(s); see Odoo logs')
+            msg += f" Errors: {'; '.join(shown)}"
         icp = self.env['ir.config_parameter'].sudo()
         icp.set_param('softlife.sync.last_sync', fields.Datetime.now())
         icp.set_param('softlife.sync.last_sync_summary', msg)
@@ -356,6 +379,7 @@ class SoftlifeSyncClient(models.TransientModel):
     @api.model
     def _cron_sync(self):
         try:
-            self.sync_all()
+            with self.env.cr.savepoint():
+                self.sync_all()
         except Exception as e:
             _logger.warning('SoftLife cron sync failed: %s', e)
