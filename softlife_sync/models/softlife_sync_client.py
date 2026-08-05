@@ -255,7 +255,8 @@ class SoftlifeSyncClient(models.TransientModel):
                         'select': 'position,product_id,product_type,enabled',
                         'machine_id': f'eq.{row.get("id")}',
                     })
-                    self._apply_ingredients(machine, ing_rows)
+                    issues = self._apply_ingredients(machine, ing_rows)
+                    warnings.extend(f'{imei} ingredients: {issue}' for issue in issues)
             except Exception as e:
                 warnings.append(f'{imei} ingredients: {e}')
                 _logger.warning('softlife_sync ingredients for %s: %s', imei, e)
@@ -269,21 +270,23 @@ class SoftlifeSyncClient(models.TransientModel):
         Template = self.env['product.template']
         pos_to_line = {ln.position: ln for ln in machine.ingredient_line_ids}
         desired = set()
+        issues = []
         for row in ing_rows:
             pos = row.get('position')
             if not pos:
                 continue
-            desired.add(pos)
             vals = {
                 'position': pos,
                 'product_type': row.get('product_type') or 'topping',
                 'enabled': bool(row.get('enabled', True)),
             }
             pid = row.get('product_id')
-            if pid:
-                tmpl = Template.search([('supabase_id', '=', pid)], limit=1)
-                if tmpl and tmpl.product_variant_id:
-                    vals['product_id'] = tmpl.product_variant_id.id
+            tmpl = Template.search([('supabase_id', '=', pid)], limit=1) if pid else Template
+            if not tmpl or not tmpl.product_variant_id:
+                issues.append(f'{pos} has no linked Odoo product')
+                continue
+            desired.add(pos)
+            vals['product_id'] = tmpl.product_variant_id.id
             if pos in pos_to_line:
                 pos_to_line[pos].write(vals)
             else:
@@ -291,6 +294,7 @@ class SoftlifeSyncClient(models.TransientModel):
         for pos, ln in pos_to_line.items():
             if pos not in desired:
                 ln.unlink()
+        return issues
 
     @api.model
     def sync_orders(self):
