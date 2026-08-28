@@ -6,5 +6,14 @@
                   parent="softlife_machine.menu_softlife_root"
                   sequence="40"
                   action="action_softlife_sync_now"/>
+        <menuitem id="menu_softlife_manufacturing_runs" name="Manufacturing Runs"
+                  parent="softlife_machine.menu_softlife_root" sequence="41"
+                  action="action_softlife_manufacturing_runs" groups="base.group_system"/>
+        <menuitem id="menu_softlife_manufacturing_create" name="Create Manufacturing Period"
+                  parent="softlife_machine.menu_softlife_root" sequence="42"
+                  action="action_softlife_manufacturing_period_wizard" groups="base.group_system"/>
+        <menuitem id="menu_softlife_manufacturing_refresh" name="Refresh Manufacturing Runs"
+                  parent="softlife_machine.menu_softlife_root" sequence="43"
+                  action="action_softlife_manufacturing_refresh" groups="base.group_system"/>
     </data>
 </odoo>

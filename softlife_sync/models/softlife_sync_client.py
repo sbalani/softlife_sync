@@ -3,11 +3,22 @@ into Odoo. Odoo is the downstream ERP; the middleware is the system of record.
 """
 import datetime
 import logging
+from urllib.parse import urljoin
 
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
+
+
+class SoftlifeAPIError(UserError):
+    """A platform HTTP failure with enough detail for a retry decision."""
+
+    def __init__(self, message, status=None, code=None, retryable=False):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.retryable = retryable
 
 
 class SoftlifeSyncClient(models.TransientModel):
@@ -27,6 +38,64 @@ class SoftlifeSyncClient(models.TransientModel):
             self._param('softlife.sync.supabase_url')
             and self._param('softlife.sync.supabase_key')
         )
+
+    @api.model
+    def _api_is_configured(self):
+        return bool(
+            self._param('softlife.sync.platform_url')
+            and self._param('softlife.sync.odoo_sync_secret')
+        )
+
+    @api.model
+    def _api_request(self, method, path, params=None, payload=None):
+        import requests
+        base = (self._param('softlife.sync.platform_url') or '').strip().rstrip('/')
+        secret = self._param('softlife.sync.odoo_sync_secret')
+        if not base or not secret:
+            raise SoftlifeAPIError(_('Platform App URL / Odoo sync secret not configured.'), code='not_configured')
+        url = urljoin(f'{base}/', path.lstrip('/'))
+        try:
+            response = requests.request(
+                method, url, params=params, json=payload,
+                headers={'x-odoo-sync-secret': secret, 'Accept': 'application/json'},
+                timeout=(10, 60),
+            )
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            raise SoftlifeAPIError(
+                _('Platform request failed: %s') % exc, code='network_error', retryable=True,
+            ) from exc
+        try:
+            body = response.json() if response.content else {}
+        except ValueError:
+            body = {}
+        if not 200 <= response.status_code < 300:
+            message = body.get('error') if isinstance(body, dict) else None
+            code = body.get('code') if isinstance(body, dict) else None
+            raise SoftlifeAPIError(
+                _('Platform %s %s failed (%s): %s') % (
+                    method, path, response.status_code, message or response.text[:500],
+                ),
+                status=response.status_code, code=code,
+                retryable=response.status_code in (408, 425, 429) or response.status_code >= 500,
+            )
+        if not isinstance(body, dict):
+            raise SoftlifeAPIError(_('Platform returned an invalid JSON object.'), code='invalid_response')
+        return body
+
+    @api.model
+    def _api_catalog_pages(self):
+        cursor = None
+        while True:
+            params = {'limit': 500}
+            if cursor:
+                params['cursor'] = cursor
+            page = self._api_request('GET', '/api/internal/odoo/catalog', params=params)
+            yield page
+            if not page.get('has_more'):
+                break
+            cursor = page.get('next_cursor')
+            if not cursor:
+                raise SoftlifeAPIError(_('Catalog pagination omitted next_cursor.'), code='invalid_response')
 
     @api.model
     def _rest_get(self, table, params=None):
@@ -252,7 +321,7 @@ class SoftlifeSyncClient(models.TransientModel):
             try:
                 with self.env.cr.savepoint():
                     ing_rows = self._rest_get('machine_ingredients', {
-                        'select': 'position,product_id,product_type,enabled',
+                        'select': 'position,product_id,product_type,enabled,products(odoo_id)',
                         'machine_id': f'eq.{row.get("id")}',
                     })
                     issues = self._apply_ingredients(machine, ing_rows)
@@ -267,7 +336,7 @@ class SoftlifeSyncClient(models.TransientModel):
     def _apply_ingredients(self, machine, ing_rows):
         """Merge Supabase hopper config into Odoo ingredient lines by position
         (preserves portion size / cycled on existing lines; Supabase is source of truth)."""
-        Template = self.env['product.template']
+        Product = self.env['product.product']
         pos_to_line = {ln.position: ln for ln in machine.ingredient_line_ids}
         desired = set()
         issues = []
@@ -280,13 +349,16 @@ class SoftlifeSyncClient(models.TransientModel):
                 'product_type': row.get('product_type') or 'topping',
                 'enabled': bool(row.get('enabled', True)),
             }
-            pid = row.get('product_id')
-            tmpl = Template.search([('supabase_id', '=', pid)], limit=1) if pid else Template
-            if not tmpl or not tmpl.product_variant_id:
+            relation = row.get('products') or {}
+            if isinstance(relation, list):
+                relation = relation[0] if relation else {}
+            odoo_id = relation.get('odoo_id') if isinstance(relation, dict) else None
+            product = Product.browse(int(odoo_id)).exists() if odoo_id else Product
+            if not product:
                 issues.append(f'{pos} has no linked Odoo product')
                 continue
             desired.add(pos)
-            vals['product_id'] = tmpl.product_variant_id.id
+            vals['product_id'] = product.id
             if pos in pos_to_line:
                 pos_to_line[pos].write(vals)
             else:
@@ -375,7 +447,6 @@ class SoftlifeSyncClient(models.TransientModel):
         for name, fn in (('partners', self.sync_partners),
                          ('products', self.sync_products),
                          ('machines', self.sync_machines),
-                         ('orders', self.sync_orders),
                          ('odoo_warehouses', self.sync_odoo_warehouses),
                          ('odoo_products', self.sync_odoo_products),
                          ('odoo_lots', self.sync_odoo_lots),
@@ -398,8 +469,7 @@ class SoftlifeSyncClient(models.TransientModel):
         msg = (
             f"Synced {count('partners')} customer(s), "
             f"{count('products')} product(s), "
-            f"{count('machines')} machine(s), "
-            f"{count('orders')} order(s); "
+            f"{count('machines')} machine(s); "
             f"mirrored {count('odoo_products')} Odoo SKU(s), "
             f"{count('odoo_lots')} lot(s), "
             f"{count('odoo_lot_stock')} warehouse lot balance(s), "

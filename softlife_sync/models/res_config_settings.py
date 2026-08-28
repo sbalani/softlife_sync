@@ -10,6 +10,12 @@ class ResConfigSettings(models.TransientModel):
     softlife_supabase_key = fields.Char(
         string='Service Role Key', config_parameter='softlife.sync.supabase_key',
     )
+    softlife_platform_url = fields.Char(
+        string='Platform App URL', config_parameter='softlife.sync.platform_url',
+    )
+    softlife_odoo_sync_secret = fields.Char(
+        string='Odoo Sync Secret', config_parameter='softlife.sync.odoo_sync_secret',
+    )
     softlife_default_partner_id = fields.Many2one(
         'res.partner', string='Default customer for orders',
         config_parameter='softlife.sync.default_partner_id',

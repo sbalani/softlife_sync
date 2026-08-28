@@ -1,7 +1,7 @@
 {
     'name': 'SoftLife Platform Sync',
-    'version': '18.0.1.0.3',
-    'summary': 'Pull operational data (customers, products, orders -> invoices) from the SoftLife platform (Supabase) into Odoo.',
+    'version': '18.0.2.0.0',
+    'summary': 'Synchronize SoftLife master data and manufacturing periods with Odoo.',
     'description': """
 SoftLife Platform Sync
 ======================
@@ -10,7 +10,7 @@ system of record operated by the middleware) and mirrors into Odoo:
 
   tenants        -> res.partner (customers)
   products       -> product.template
-  huaxin_orders  -> account.move (draft customer invoices -> feeds VeriFactu)
+  manufacturing periods -> MOs, warehouse sales orders and validated deliveries
 
 ...and mirrors Odoo's own SKU/lot/warehouse master data back out to Supabase
 (read-only mirror tables the platform consumes — see softlife-platform/README):
@@ -27,19 +27,20 @@ from the mirror tables on the next sync; any ingredient linked to a pruned
 row is automatically unlinked (FK is ON DELETE SET NULL), never re-pointed.
 
 Odoo no longer talks to Huaxin directly — the middleware owns Huaxin.
-Idempotent by Supabase id / order code / odoo_id. Run via Settings, the
-"Platform Sync" menu, or an hourly cron.
+Idempotent by immutable platform ids with SQL uniqueness in Odoo. Run via
+Settings, the Platform Sync / Manufacturing menus, or scheduled crons.
 """,
     'author': 'SoftLife',
     'website': 'https://softlife.es',
     'category': 'Accounting/Accounting',
     'license': 'OPL-1',
-    'depends': ['softlife_machine', 'account', 'stock'],
+    'depends': ['softlife_machine', 'account', 'stock', 'mrp', 'sale_management'],
     'data': [
         'security/ir.model.access.csv',
         'data/softlife_sync_data.xml',
         'data/ir_cron.xml',
         'views/res_config_settings_views.xml',
+        'views/manufacturing_run_views.xml',
         'views/menus.xml',
     ],
     'installable': True,

@@ -15,11 +15,12 @@
                             <setting id="softlife_key" string="Service Role Key">
                                 <field name="softlife_supabase_key"/>
                             </setting>
-                            <setting id="softlife_partner" string="Default customer for orders">
-                                <field name="softlife_default_partner_id"/>
+                            <setting id="softlife_platform_url" string="Platform App URL"
+                                     help="Application origin, for example https://app.softlife.example. Distinct from Supabase.">
+                                <field name="softlife_platform_url" placeholder="https://app.example.com"/>
                             </setting>
-                            <setting id="softlife_product" string="Default product for order lines">
-                                <field name="softlife_default_product_id"/>
+                            <setting id="softlife_odoo_secret" string="Odoo Sync Secret">
+                                <field name="softlife_odoo_sync_secret" password="True"/>
                             </setting>
                             <setting id="softlife_last" string="Last sync">
                                 <field name="softlife_last_sync" readonly="1"/>
