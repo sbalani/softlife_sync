@@ -233,6 +233,8 @@ class SoftlifeSyncClient(models.TransientModel):
                 'category': p.categ_id.display_name if p.categ_id else None,
                 'uom': p.uom_id.name if p.uom_id else None,
                 'qty_available': p.qty_available,
+                'package_content_quantity': p.package_content_quantity or None,
+                'package_content_uom': p.package_content_uom or None,
             })
         self._rest_upsert('odoo_products', rows, on_conflict='odoo_id')
         # Deleted/archived in Odoo -> drop from the mirror. Any platform ingredient

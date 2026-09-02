@@ -29,7 +29,7 @@ class SoftlifeRecipeSync(models.Model):
     ]
 
     @api.model
-    def _uom(self, code, product):
+    def _uom_by_code(self, code):
         normalized = str(code or '').strip().lower()
         aliases = {
             'g': (('uom.product_uom_gram',), {'g', 'gram', 'grams'}),
@@ -52,6 +52,15 @@ class SoftlifeRecipeSync(models.Model):
                         if row.name.strip().lower() in names), self.env['uom.uom'])
         if not uom:
             raise ValidationError(_('Odoo UoM for %s is not installed.') % code)
+        return uom
+
+    @api.model
+    def _uom(self, code, product):
+        uom = self._uom_by_code(code)
+        unit_uom = self.env.ref('uom.product_uom_unit', raise_if_not_found=False)
+        if str(code or '').strip().lower() in {'unit', 'units', 'u', 'each'} \
+                and unit_uom and product.uom_id.category_id == unit_uom.category_id:
+            return product.uom_id
         if uom.category_id != product.uom_id.category_id:
             raise ValidationError(_(
                 'UoM %(uom)s is incompatible with product %(product)s (%(product_uom)s).',
@@ -91,6 +100,14 @@ class SoftlifeRecipeSync(models.Model):
 
     @api.model
     def _component_values(self, recipe):
+        try:
+            contract_version = int(recipe.get('payload_contract_version') or 0)
+        except (TypeError, ValueError):
+            contract_version = 0
+        if contract_version != 2:
+            raise ValidationError(_(
+                'Recipe %s must use payload_contract_version 2 with frozen stock quantities.'
+            ) % recipe.get('recipe_version_id'))
         result = []
         seen = set()
         for component in recipe.get('components') or []:
@@ -106,10 +123,80 @@ class SoftlifeRecipeSync(models.Model):
             if product.id in seen:
                 raise ValidationError(_('Recipe contains duplicate Odoo component %s.') % product.display_name)
             seen.add(product.id)
-            quantity = float(component.get('quantity') or component.get('quantity_per_unit') or 0)
-            if quantity <= 0:
+            dosage_quantity = float(component.get('quantity') or component.get('quantity_per_unit') or 0)
+            if dosage_quantity <= 0:
                 raise ValidationError(_('Component quantity must be positive for %s.') % product.display_name)
-            result.append((product, quantity, self._uom(component.get('uom'), product)))
+            dosage_uom = self._uom_by_code(component.get('uom'))
+            stock_quantity = float(
+                component.get('stock_quantity_per_unit') or component.get('stock_quantity') or 0
+            )
+            if stock_quantity <= 0:
+                raise ValidationError(_(
+                    'Frozen stock_quantity_per_unit must be positive for %s.'
+                ) % product.display_name)
+            stock_uom = self._uom(component.get('stock_uom'), product)
+            if stock_uom != product.uom_id:
+                raise ValidationError(_(
+                    'Frozen stock UoM %(stock)s must equal inventory UoM %(inventory)s for %(product)s.',
+                    stock=stock_uom.display_name,
+                    inventory=product.uom_id.display_name,
+                    product=product.display_name,
+                ))
+
+            package_quantity = float(component.get('package_content_quantity') or 0)
+            package_code = component.get('package_content_uom')
+            if dosage_uom.category_id == stock_uom.category_id:
+                if bool(package_quantity) != bool(package_code):
+                    raise ValidationError(_(
+                        'Frozen package content quantity and UoM must be supplied together for %s.'
+                    ) % product.display_name)
+                expected_stock = dosage_uom._compute_quantity(
+                    dosage_quantity, stock_uom, round=False,
+                )
+                calculation = '%g %s = %.9g %s' % (
+                    dosage_quantity, component.get('uom'), expected_stock, component.get('stock_uom'),
+                )
+            else:
+                unit_uom = self.env.ref('uom.product_uom_unit', raise_if_not_found=False)
+                if not unit_uom or stock_uom.category_id != unit_uom.category_id:
+                    raise ValidationError(_(
+                        'Dosage UoM is incompatible with inventory UoM for %s and inventory is not Units.'
+                    ) % product.display_name)
+                if package_quantity <= 0 or not package_code:
+                    raise ValidationError(_(
+                        'Frozen package content is required to convert %(dosage)s to inventory Units for %(product)s.',
+                        dosage=component.get('uom'), product=product.display_name,
+                    ))
+                package_uom = self._uom_by_code(package_code)
+                if package_uom.category_id != dosage_uom.category_id:
+                    raise ValidationError(_(
+                        'Package Content UoM %(package)s is incompatible with dosage UoM %(dosage)s for %(product)s.',
+                        package=package_code, dosage=component.get('uom'), product=product.display_name,
+                    ))
+                package_in_dosage_uom = package_uom._compute_quantity(
+                    package_quantity, dosage_uom, round=False,
+                )
+                expected_stock = dosage_quantity / package_in_dosage_uom
+                calculation = '%g %s / %g %s = %.9g %s' % (
+                    dosage_quantity, component.get('uom'), package_quantity, package_code,
+                    expected_stock, component.get('stock_uom'),
+                )
+            tolerance = max(1e-9, abs(expected_stock) * 1e-8)
+            if abs(stock_quantity - expected_stock) > tolerance:
+                raise ValidationError(_(
+                    'Frozen stock conversion is inconsistent for %(product)s: expected %(expected).9g, got %(actual).9g.',
+                    product=product.display_name, expected=expected_stock, actual=stock_quantity,
+                ))
+            result.append({
+                'product': product,
+                'quantity': stock_quantity,
+                'uom': stock_uom,
+                'dosage_quantity': dosage_quantity,
+                'dosage_uom': str(component.get('uom') or ''),
+                'package_quantity': package_quantity,
+                'package_uom': str(package_code or ''),
+                'calculation': calculation,
+            })
         if not result:
             raise ValidationError(_('Recipe %s has no components.') % recipe.get('recipe_version_id'))
         return result
@@ -124,11 +211,18 @@ class SoftlifeRecipeSync(models.Model):
         if len(lines) != len(components):
             raise ValidationError(_('Mapped BOM component count does not match the platform recipe.'))
         by_product = {line.product_id.id: line for line in lines}
-        for component, quantity, uom in components:
-            line = by_product.get(component.id)
-            if not line or line.product_uom_id != uom or float_compare(
-                    line.product_qty, quantity, precision_rounding=uom.rounding):
-                raise ValidationError(_('Mapped BOM does not exactly match component %s.') % component.display_name)
+        for component in components:
+            product = component['product']
+            line = by_product.get(product.id)
+            if not line or line.product_uom_id != component['uom'] \
+                    or abs(line.product_qty - component['quantity']) > 1e-9 \
+                    or abs(line.softlife_dosage_quantity - component['dosage_quantity']) > 1e-9 \
+                    or line.softlife_dosage_uom != component['dosage_uom'] \
+                    or abs(line.softlife_stock_quantity_per_unit - component['quantity']) > 1e-9 \
+                    or abs(line.softlife_package_content_quantity - component['package_quantity']) > 1e-9 \
+                    or (line.softlife_package_content_uom or '') != component['package_uom'] \
+                    or line.softlife_conversion_audit != component['calculation']:
+                raise ValidationError(_('Mapped BOM does not exactly match component %s.') % product.display_name)
 
     @api.model
     def ensure_recipe(self, recipe):
@@ -156,6 +250,7 @@ class SoftlifeRecipeSync(models.Model):
             bom.write({
                 'softlife_recipe_version_id': version_id,
                 'softlife_component_hash': component_hash,
+                'softlife_payload_contract_version': 2,
             })
         elif mapped_id:
             raise ValidationError(_('Mapped mrp.bom %s does not exist.') % mapped_id)
@@ -170,12 +265,19 @@ class SoftlifeRecipeSync(models.Model):
                 'type': 'normal',
                 'softlife_recipe_version_id': version_id,
                 'softlife_component_hash': component_hash,
+                'softlife_payload_contract_version': 2,
                 'bom_line_ids': [(0, 0, {
-                    'product_id': component.id,
-                    'product_qty': quantity,
-                    'product_uom_id': uom.id,
+                    'product_id': component['product'].id,
+                    'product_qty': component['quantity'],
+                    'product_uom_id': component['uom'].id,
                     'sequence': sequence * 10,
-                }) for sequence, (component, quantity, uom) in enumerate(components, 1)],
+                    'softlife_dosage_quantity': component['dosage_quantity'],
+                    'softlife_dosage_uom': component['dosage_uom'],
+                    'softlife_stock_quantity_per_unit': component['quantity'],
+                    'softlife_package_content_quantity': component['package_quantity'],
+                    'softlife_package_content_uom': component['package_uom'],
+                    'softlife_conversion_audit': component['calculation'],
+                }) for sequence, component in enumerate(components, 1)],
             })
         needs_callback = int(recipe.get('odoo_finished_product_id') or 0) != product.id \
             or int(recipe.get('odoo_bom_id') or 0) != bom.id
@@ -248,7 +350,10 @@ class SoftlifeManufacturingRun(models.Model):
             'period_from': remote.get('period_from'), 'period_to': remote.get('period_to'),
             'time_zone': remote.get('time_zone'), 'document_date': remote.get('document_date'),
             'payload_sha256': remote.get('payload_sha256'),
-            'payload': {'warehouses': remote.get('warehouses') or []},
+            'payload': {
+                'payload_contract_version': remote.get('payload_contract_version'),
+                'warehouses': remote.get('warehouses') or [],
+            },
             'blocked_items': remote.get('blocked_items') or [],
             'platform_result': remote.get('odoo_result') or False,
         }
@@ -297,6 +402,10 @@ class SoftlifeManufacturingRun(models.Model):
         Recipe = self.env['softlife.recipe.sync']
         for page in self.env['softlife.sync.client']._api_catalog_pages():
             for recipe in page.get('recipe_versions') or []:
+                if not recipe.get('payload_contract_version') and page.get('payload_contract_version'):
+                    recipe = dict(recipe, payload_contract_version=page['payload_contract_version'])
+                if int(recipe.get('payload_contract_version') or 0) != 2:
+                    continue
                 try:
                     with self.env.cr.savepoint():
                         Recipe.ensure_recipe(recipe)
@@ -325,7 +434,7 @@ class SoftlifeManufacturingRun(models.Model):
         self.upsert_remote(remote)
         return True
 
-    def _recipe_from_group(self, group):
+    def _recipe_from_group(self, group, payload_contract_version=None):
         sync = self.env['softlife.recipe.sync'].search([
             ('recipe_version_id', '=', str(group.get('recipe_version_id') or '')),
         ], limit=1)
@@ -334,10 +443,15 @@ class SoftlifeManufacturingRun(models.Model):
         return {
             'recipe_id': group.get('recipe_id'), 'recipe_version_id': group.get('recipe_version_id'),
             'component_hash': sync.component_hash, 'name': group.get('name'),
+            'payload_contract_version': group.get('payload_contract_version') or payload_contract_version,
             'odoo_finished_product_id': group.get('odoo_finished_product_id'),
             'components': [{
                 'odoo_product_id': component.get('odoo_product_id'),
                 'quantity': component.get('quantity_per_unit'), 'uom': component.get('uom'),
+                'stock_quantity_per_unit': component.get('stock_quantity_per_unit'),
+                'stock_uom': component.get('stock_uom'),
+                'package_content_quantity': component.get('package_content_quantity'),
+                'package_content_uom': component.get('package_content_uom'),
             } for component in group.get('components') or []],
         }
 
@@ -462,12 +576,31 @@ class SoftlifeManufacturingRun(models.Model):
             sale_totals = {}
             warehouse_mo_ids = []
             for group in groups:
-                recipe_sync = self.env['softlife.recipe.sync'].ensure_recipe(self._recipe_from_group(group))
-                self._require_make_to_stock(recipe_sync.product_id)
                 quantity = float(group.get('units_sold') or 0)
                 gross = float(group.get('gross_sales') or 0)
                 if quantity <= 0 or gross < 0:
                     raise ValidationError(_('Invalid platform quantities for recipe %s.') % group.get('recipe_version_id'))
+                for component in group.get('components') or []:
+                    dosage_per_unit = float(component.get('quantity_per_unit') or 0)
+                    dosage_total = float(component.get('total_quantity') or 0)
+                    stock_per_unit = float(component.get('stock_quantity_per_unit') or 0)
+                    stock_total = float(component.get('stock_total_quantity') or 0)
+                    expected_dosage_total = dosage_per_unit * quantity
+                    expected_stock_total = stock_per_unit * quantity
+                    if dosage_total <= 0 or abs(dosage_total - expected_dosage_total) > max(
+                            1e-9, abs(expected_dosage_total) * 1e-8):
+                        raise ValidationError(_(
+                            'Frozen total_quantity is missing or inconsistent for recipe component %s.'
+                        ) % component.get('odoo_product_id'))
+                    if stock_total <= 0 or abs(stock_total - expected_stock_total) > max(
+                            1e-9, abs(expected_stock_total) * 1e-8):
+                        raise ValidationError(_(
+                            'Frozen stock_total_quantity is missing or inconsistent for recipe component %s.'
+                        ) % component.get('odoo_product_id'))
+                recipe_sync = self.env['softlife.recipe.sync'].ensure_recipe(self._recipe_from_group(
+                    group, (self.payload or {}).get('payload_contract_version'),
+                ))
+                self._require_make_to_stock(recipe_sync.product_id)
                 mo = self.env['mrp.production'].search([
                     ('softlife_export_id', '=', self.export_id),
                     ('softlife_warehouse_id', '=', warehouse.id),

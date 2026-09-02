@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Approved globally so existing Unit-stocked ingredients keep their UoM and history. -->
+    <record id="uom.product_uom_unit" model="uom.uom" forcecreate="False">
+        <field name="rounding" eval="0.000001"/>
+    </record>
+    <record id="product.decimal_product_uom" model="decimal.precision" forcecreate="False">
+        <field name="digits" eval="6"/>
+    </record>
+</odoo>

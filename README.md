@@ -65,6 +65,24 @@ per recipe version, one MO per export/warehouse/version/currency, and one sales
 order per export/warehouse. Sales orders are confirmed and deliveries validated;
 this module never creates an invoice from a manufacturing period.
 
+### Package content and recipe dosage
+
+Ingredient inventory remains in its existing Odoo UoM (normally **Units**).
+Configure **Net Content per Unit** and **Content UoM** on an ingredient, for
+example `1120 g`. The module derives OCA's inverse secondary-UoM factor and
+hides that implementation detail. It does not rewrite existing quants, lots,
+purchase orders, or stock moves.
+
+Manufacturing accepts only payload contract v2. It verifies the platform's
+frozen physical dosage, package snapshot, `stock_quantity_per_unit`, and
+`stock_total_quantity`, then writes the fractional Unit quantity to the BOM.
+For example, `100 g / 1120 g = 0.0892857143 Units`. The calculation and frozen
+values remain visible on the BOM line for audit; later product configuration
+changes do not alter an existing recipe version. Standard **Units** and Product
+Unit of Measure display precision are set to six decimal places. This preserves
+the inventory UoM and numeric values of all existing quants, lots, purchase
+orders, and stock moves while allowing fractional package consumption.
+
 ## Install
 Clone into your Odoo addons path named `softlife_sync`:
 ```bash

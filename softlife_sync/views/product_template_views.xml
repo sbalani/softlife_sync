@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_product_template_form_softlife_package_content" model="ir.ui.view">
+        <field name="name">product.template.form.softlife.package.content</field>
+        <field name="model">product.template</field>
+        <field name="inherit_id" ref="product.product_template_only_form_view"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='uom_id']" position="after">
+                <field name="package_content_quantity" placeholder="e.g. 1120"/>
+                <field name="package_content_uom"/>
+            </xpath>
+        </field>
+    </record>
+
+    <record id="view_mrp_bom_form_softlife_conversion_audit" model="ir.ui.view">
+        <field name="name">mrp.bom.form.softlife.conversion.audit</field>
+        <field name="model">mrp.bom</field>
+        <field name="inherit_id" ref="mrp.mrp_bom_form_view"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='bom_line_ids']//field[@name='product_qty']" position="after">
+                <field name="softlife_dosage_quantity" string="SoftLife Dosage" optional="hide"/>
+                <field name="softlife_dosage_uom" string="Dosage UoM" optional="hide"/>
+                <field name="softlife_package_content_quantity" string="Package Content" optional="hide"/>
+                <field name="softlife_package_content_uom" string="Content UoM" optional="hide"/>
+                <field name="softlife_conversion_audit" string="SoftLife Conversion" optional="show"/>
+            </xpath>
+        </field>
+    </record>
+
+    <record id="view_product_template_form_hide_secondary_factor" model="ir.ui.view">
+        <field name="name">product.template.form.hide.secondary.factor</field>
+        <field name="model">product.template</field>
+        <field name="inherit_id" ref="product_secondary_unit.product_template_form_view"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='secondary_uom_ids']/list/field[@name='factor']" position="attributes">
+                <attribute name="column_invisible">1</attribute>
+            </xpath>
+        </field>
+    </record>
+</odoo>

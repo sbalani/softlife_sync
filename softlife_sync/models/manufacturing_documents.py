@@ -6,11 +6,23 @@ class MrpBom(models.Model):
 
     softlife_recipe_version_id = fields.Char(index=True, copy=False)
     softlife_component_hash = fields.Char(copy=False)
+    softlife_payload_contract_version = fields.Integer(copy=False)
 
     _sql_constraints = [
         ('softlife_recipe_version_unique', 'unique(softlife_recipe_version_id)',
          'A SoftLife recipe version can only have one bill of materials.'),
     ]
+
+
+class MrpBomLine(models.Model):
+    _inherit = 'mrp.bom.line'
+
+    softlife_dosage_quantity = fields.Float(digits=(16, 6), copy=False)
+    softlife_dosage_uom = fields.Char(copy=False)
+    softlife_stock_quantity_per_unit = fields.Float(digits=(16, 9), copy=False)
+    softlife_package_content_quantity = fields.Float(digits=(16, 6), copy=False)
+    softlife_package_content_uom = fields.Char(copy=False)
+    softlife_conversion_audit = fields.Char(copy=False)
 
 
 class MrpProduction(models.Model):
