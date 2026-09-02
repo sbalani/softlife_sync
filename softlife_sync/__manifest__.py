@@ -1,6 +1,6 @@
 {
     'name': 'SoftLife Platform Sync',
-    'version': '18.0.3.0.0',
+    'version': '18.0.3.0.1',
     'summary': 'Synchronize SoftLife master data and manufacturing periods with Odoo.',
     'description': """
 SoftLife Platform Sync
