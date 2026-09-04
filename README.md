@@ -41,6 +41,13 @@ next sync. If a platform ingredient was linked to a pruned record, the link
 is automatically cleared (`products.odoo_id` has `ON DELETE SET NULL`) — it's
 never silently re-pointed at something else.
 
+Warehouse lot stock is sent as a complete snapshot to
+`/api/internal/odoo/lot-stock-snapshot`. Rows are grouped from positive
+internal quants by Odoo lot and warehouse; global lot quantities are never
+assigned to a warehouse by inference. The connector sends
+`reflected_references: []` until it can prove movement references are present
+in the same Odoo state.
+
 Odoo **no longer talks to Huaxin directly**; `softlife_huaxin` is retired.
 
 Direct vending-order invoice import is no longer part of `sync_all`. The old

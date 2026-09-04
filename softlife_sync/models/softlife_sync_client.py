@@ -3,6 +3,7 @@ into Odoo. Odoo is the downstream ERP; the middleware is the system of record.
 """
 import datetime
 import logging
+import math
 from urllib.parse import urljoin
 
 from odoo import _, api, fields, models
@@ -280,12 +281,20 @@ class SoftlifeSyncClient(models.TransientModel):
                 continue
             key = (quant.lot_id.id, warehouse.id)
             quantities[key] = quantities.get(key, 0.0) + quant.quantity
-        rows = [{
-            'odoo_lot_id': lot_id,
-            'odoo_warehouse_id': warehouse_id,
-            'qty': quantity,
-        } for (lot_id, warehouse_id), quantity in quantities.items() if quantity > 0]
-        self._rest_rpc('replace_odoo_lot_stock', {'p_rows': rows})
+        rows = [
+            {
+                'odoo_lot_id': lot_id,
+                'odoo_warehouse_id': warehouse_id,
+                'qty': quantity,
+            }
+            for (lot_id, warehouse_id), quantity in sorted(quantities.items())
+            if math.isfinite(quantity) and quantity > 0
+        ]
+        self._api_request(
+            'POST',
+            '/api/internal/odoo/lot-stock-snapshot',
+            payload={'rows': rows, 'reflected_references': []},
+        )
         return len(rows)
 
     @api.model
