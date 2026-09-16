@@ -1,4 +1,4 @@
-from odoo.exceptions import ValidationError
+from odoo.exceptions import UserError, ValidationError
 from odoo.tests.common import TransactionCase
 
 
@@ -20,3 +20,21 @@ class TestManufacturingRun(TransactionCase):
                 'export_id': 'export-1',
                 'period_from': 'not-a-datetime',
             })
+
+    def test_processing_requires_warehouse_company_to_be_active(self):
+        other_company = self.env['res.company'].create({'name': 'Other Manufacturing Company'})
+        warehouse = self.env['stock.warehouse'].search([
+            ('company_id', '=', other_company.id),
+        ], limit=1)
+        if not warehouse:
+            warehouse = self.env['stock.warehouse'].create({
+                'name': 'Other Manufacturing Warehouse',
+                'code': 'OMW',
+                'company_id': other_company.id,
+            })
+        run = self.env['softlife.manufacturing.run'].new({
+            'payload': {'warehouses': [{'odoo_warehouse_id': warehouse.id}]},
+        })
+
+        with self.assertRaisesRegex(UserError, 'Switch the active Odoo company'):
+            run._check_active_company()

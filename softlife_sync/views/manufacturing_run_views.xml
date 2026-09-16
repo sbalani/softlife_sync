@@ -6,6 +6,7 @@
         <field name="arch" type="xml">
             <list create="0" delete="0">
                 <field name="document_date"/>
+                <field name="idempotency_key"/>
                 <field name="period_from"/>
                 <field name="period_to"/>
                 <field name="time_zone"/>

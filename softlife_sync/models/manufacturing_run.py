@@ -540,6 +540,33 @@ class SoftlifeManufacturingRun(models.Model):
                     pickings=', '.join(pending.mapped('display_name')),
                 ))
 
+    def _check_active_company(self):
+        self.ensure_one()
+        warehouse_ids = {
+            int(warehouse.get('odoo_warehouse_id') or 0)
+            for warehouse in (self.payload or {}).get('warehouses') or []
+        } - {0}
+        if not warehouse_ids:
+            return
+        warehouses = self.env['stock.warehouse'].browse(sorted(warehouse_ids)).exists()
+        missing_ids = warehouse_ids - set(warehouses.ids)
+        if missing_ids:
+            raise ValidationError(_(
+                'Run references missing Odoo warehouses: %s.'
+            ) % ', '.join(map(str, sorted(missing_ids))))
+        companies = warehouses.company_id
+        if len(companies) != 1:
+            raise ValidationError(_(
+                'Run warehouses span multiple Odoo companies: %s.'
+            ) % ', '.join(companies.mapped('display_name')))
+        if companies != self.env.company:
+            raise UserError(_(
+                'Switch the active Odoo company to %(required)s before processing this run. '
+                'The current active company is %(current)s.',
+                required=companies.display_name,
+                current=self.env.company.display_name,
+            ))
+
     def _require_make_to_stock(self, product):
         mto_route = self.env.ref('stock.route_warehouse0_mto', raise_if_not_found=False)
         routes = product.route_ids
@@ -729,6 +756,7 @@ class SoftlifeManufacturingRun(models.Model):
 
     def action_process(self):
         self.ensure_one()
+        self._check_active_company()
         if not self.env.context.get('softlife_catalog_synced'):
             self.action_sync_catalog()
         self.env.cr.execute(
