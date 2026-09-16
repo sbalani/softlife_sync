@@ -498,8 +498,7 @@ class SoftlifeManufacturingRun(models.Model):
         values = {'date_start': document_datetime}
         if 'date_finished' in mo._fields:
             values['date_finished'] = document_datetime
-        mo.write(values)
-        (mo.move_raw_ids | mo.move_finished_ids).write({'date': document_datetime})
+        mo.with_context(force_date=True).write(values)
 
     def _validate_delivery(self, picking, document_datetime):
         picking.action_assign()
@@ -780,7 +779,7 @@ class SoftlifeManufacturingRun(models.Model):
             })
         except Exception as exc:
             self.write({
-                'processing_state': 'result_pending',
+                'processing_state': 'failed' if retrying_rejection else 'result_pending',
                 'result_payload': {
                     'accepted': False, 'payload_sha256': self.payload_sha256, 'error': str(exc),
                 },
@@ -792,6 +791,13 @@ class SoftlifeManufacturingRun(models.Model):
     def action_retry_callback(self):
         client = self.env['softlife.sync.client']
         for run in self.filtered(lambda row: row.processing_state == 'result_pending' and row.result_payload):
+            if isinstance(run.result_payload, dict) \
+                    and run.result_payload.get('accepted') is False \
+                    and run.platform_status == 'failed' \
+                    and isinstance(run.platform_result, dict) \
+                    and run.platform_result.get('accepted') is False:
+                run.write({'processing_state': 'failed', 'callback_error': False})
+                continue
             try:
                 remote = client._api_request(
                     'POST', f'/api/internal/odoo/manufacturing-periods/{run.export_id}/result',

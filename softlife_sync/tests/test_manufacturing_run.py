@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from odoo.exceptions import UserError, ValidationError
 from odoo.tests.common import TransactionCase
 
@@ -38,3 +40,20 @@ class TestManufacturingRun(TransactionCase):
 
         with self.assertRaisesRegex(UserError, 'Switch the active Odoo company'):
             run._check_active_company()
+
+    def test_repeated_rejection_does_not_replace_platform_result(self):
+        run = self.env['softlife.manufacturing.run'].create({
+            'export_id': 'export-retry',
+            'platform_status': 'failed',
+            'processing_state': 'result_pending',
+            'platform_result': {'accepted': False, 'error': 'First failure'},
+            'result_payload': {'accepted': False, 'error': 'Retry failure'},
+        })
+        client = self.env['softlife.sync.client']
+
+        with patch.object(type(client), '_api_request') as request:
+            run.action_retry_callback()
+
+        request.assert_not_called()
+        self.assertEqual(run.processing_state, 'failed')
+        self.assertFalse(run.callback_error)
