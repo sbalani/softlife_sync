@@ -1,3 +1,4 @@
+import datetime
 import logging
 
 from odoo import _, api, fields, models
@@ -343,11 +344,25 @@ class SoftlifeManufacturingRun(models.Model):
     ]
 
     @api.model
+    def _utc_datetime(self, value):
+        if not value:
+            return False
+        try:
+            parsed = datetime.datetime.fromisoformat(value.replace('Z', '+00:00')) \
+                if isinstance(value, str) else fields.Datetime.to_datetime(value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(_('Platform returned an invalid datetime: %s') % value) from exc
+        if parsed.tzinfo:
+            parsed = parsed.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return fields.Datetime.to_string(parsed)
+
+    @api.model
     def _remote_values(self, remote):
         return {
             'export_id': remote.get('export_id'), 'idempotency_key': remote.get('idempotency_key'),
             'initiated_by': remote.get('initiated_by'), 'platform_status': remote.get('status'),
-            'period_from': remote.get('period_from'), 'period_to': remote.get('period_to'),
+            'period_from': self._utc_datetime(remote.get('period_from')),
+            'period_to': self._utc_datetime(remote.get('period_to')),
             'time_zone': remote.get('time_zone'), 'document_date': remote.get('document_date'),
             'payload_sha256': remote.get('payload_sha256'),
             'payload': {
