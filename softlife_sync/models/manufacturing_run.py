@@ -1,7 +1,7 @@
 import datetime
 import logging
 
-from odoo import _, api, fields, models
+from odoo import _, api, Command, fields, models
 from odoo.exceptions import UserError, ValidationError
 from odoo.tools.float_utils import float_compare
 
@@ -226,6 +226,39 @@ class SoftlifeRecipeSync(models.Model):
                 raise ValidationError(_('Mapped BOM does not exactly match component %s.') % product.display_name)
 
     @api.model
+    def _bom_line_commands(self, components):
+        return [Command.create({
+            'product_id': component['product'].id,
+            'product_qty': component['quantity'],
+            'product_uom_id': component['uom'].id,
+            'sequence': sequence * 10,
+            'softlife_dosage_quantity': component['dosage_quantity'],
+            'softlife_dosage_uom': component['dosage_uom'],
+            'softlife_stock_quantity_per_unit': component['quantity'],
+            'softlife_package_content_quantity': component['package_quantity'],
+            'softlife_package_content_uom': component['package_uom'],
+            'softlife_conversion_audit': component['calculation'],
+        }) for sequence, component in enumerate(components, 1)]
+
+    @api.model
+    def _upgrade_or_validate_bom(self, bom, product, components, component_hash, version_id):
+        if bom.softlife_payload_contract_version == 2:
+            self._validate_bom(bom, product, components, component_hash)
+            return
+        if bom.product_tmpl_id != product.product_tmpl_id or (bom.product_id and bom.product_id != product):
+            raise ValidationError(_('Mapped BOM belongs to a different finished product.'))
+        if bom.softlife_component_hash and bom.softlife_component_hash != component_hash:
+            raise ValidationError(_('Mapped BOM has a different component hash.'))
+        bom.write({
+            'softlife_recipe_version_id': version_id,
+            'softlife_component_hash': component_hash,
+            'softlife_payload_contract_version': 2,
+            'bom_line_ids': [Command.delete(line.id) for line in bom.bom_line_ids]
+                + self._bom_line_commands(components),
+        })
+        self._validate_bom(bom, product, components, component_hash)
+
+    @api.model
     def ensure_recipe(self, recipe):
         version_id = str(recipe.get('recipe_version_id') or '')
         recipe_id = str(recipe.get('recipe_id') or '')
@@ -246,17 +279,11 @@ class SoftlifeRecipeSync(models.Model):
             conflict = mapped.softlife_recipe_version_id
             if conflict and conflict != version_id:
                 raise ValidationError(_('Mapped BOM belongs to recipe version %s.') % conflict)
-            self._validate_bom(mapped, product, components, component_hash)
             bom = mapped
-            bom.write({
-                'softlife_recipe_version_id': version_id,
-                'softlife_component_hash': component_hash,
-                'softlife_payload_contract_version': 2,
-            })
         elif mapped_id:
             raise ValidationError(_('Mapped mrp.bom %s does not exist.') % mapped_id)
-        elif bom:
-            self._validate_bom(bom, product, components, component_hash)
+        if bom:
+            self._upgrade_or_validate_bom(bom, product, components, component_hash, version_id)
         else:
             bom = self.env['mrp.bom'].create({
                 'product_tmpl_id': product.product_tmpl_id.id,
@@ -267,18 +294,7 @@ class SoftlifeRecipeSync(models.Model):
                 'softlife_recipe_version_id': version_id,
                 'softlife_component_hash': component_hash,
                 'softlife_payload_contract_version': 2,
-                'bom_line_ids': [(0, 0, {
-                    'product_id': component['product'].id,
-                    'product_qty': component['quantity'],
-                    'product_uom_id': component['uom'].id,
-                    'sequence': sequence * 10,
-                    'softlife_dosage_quantity': component['dosage_quantity'],
-                    'softlife_dosage_uom': component['dosage_uom'],
-                    'softlife_stock_quantity_per_unit': component['quantity'],
-                    'softlife_package_content_quantity': component['package_quantity'],
-                    'softlife_package_content_uom': component['package_uom'],
-                    'softlife_conversion_audit': component['calculation'],
-                }) for sequence, component in enumerate(components, 1)],
+                'bom_line_ids': self._bom_line_commands(components),
             })
         needs_callback = int(recipe.get('odoo_finished_product_id') or 0) != product.id \
             or int(recipe.get('odoo_bom_id') or 0) != bom.id

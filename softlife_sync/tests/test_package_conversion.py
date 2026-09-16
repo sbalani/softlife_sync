@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+from odoo import Command
 from odoo.exceptions import ValidationError
 from odoo.tests.common import TransactionCase
 
@@ -57,6 +58,37 @@ class TestPackageConversion(TransactionCase):
         self.assertEqual(line.softlife_package_content_quantity, 1120)
         self.assertEqual(line.softlife_package_content_uom, 'g')
         self.assertEqual(line.softlife_conversion_audit, '100 g / 1120 g = 0.0892857143 unit')
+
+    def test_upgrades_legacy_softlife_bom_to_frozen_stock_contract(self):
+        finished_product = self.env['product.product'].create({
+            'name': 'Legacy SoftLife recipe',
+            'is_storable': True,
+            'softlife_recipe_id': 'recipe-1',
+        })
+        legacy_bom = self.env['mrp.bom'].create({
+            'product_tmpl_id': finished_product.product_tmpl_id.id,
+            'product_id': finished_product.id,
+            'product_qty': 1,
+            'product_uom_id': finished_product.uom_id.id,
+            'type': 'normal',
+            'softlife_recipe_version_id': 'version-1',
+            'softlife_component_hash': 'hash-1',
+            'bom_line_ids': [Command.create({
+                'product_id': self.product.id,
+                'product_qty': 100,
+                'product_uom_id': self.product.uom_id.id,
+            })],
+        })
+
+        sync = self.recipe_model.ensure_recipe(self._recipe())
+
+        self.assertEqual(sync.bom_id, legacy_bom)
+        self.assertEqual(legacy_bom.softlife_payload_contract_version, 2)
+        self.assertAlmostEqual(legacy_bom.bom_line_ids.product_qty, 100 / 1120, places=12)
+        self.assertEqual(
+            legacy_bom.bom_line_ids.softlife_conversion_audit,
+            '100 g / 1120 g = 0.0892857143 unit',
+        )
 
     def test_accepts_catalog_stock_quantity_name(self):
         recipe = self._recipe()
