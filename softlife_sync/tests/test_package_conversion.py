@@ -51,13 +51,16 @@ class TestPackageConversion(TransactionCase):
         line = sync.bom_id.bom_line_ids
 
         self.assertEqual(len(line), 1)
-        self.assertAlmostEqual(line.product_qty, 100 / 1120, places=12)
+        self.assertAlmostEqual(line.product_qty, 100 / 1120, places=6)
         self.assertAlmostEqual(line.softlife_stock_quantity_per_unit, 100 / 1120, places=9)
         self.assertEqual(line.softlife_dosage_quantity, 100)
         self.assertEqual(line.softlife_dosage_uom, 'g')
         self.assertEqual(line.softlife_package_content_quantity, 1120)
         self.assertEqual(line.softlife_package_content_uom, 'g')
         self.assertEqual(line.softlife_conversion_audit, '100 g / 1120 g = 0.0892857143 unit')
+
+        reused = self.recipe_model.ensure_recipe(self._recipe())
+        self.assertEqual(reused, sync)
 
     def test_upgrades_legacy_softlife_bom_to_frozen_stock_contract(self):
         finished_product = self.env['product.product'].create({
@@ -84,7 +87,7 @@ class TestPackageConversion(TransactionCase):
 
         self.assertEqual(sync.bom_id, legacy_bom)
         self.assertEqual(legacy_bom.softlife_payload_contract_version, 2)
-        self.assertAlmostEqual(legacy_bom.bom_line_ids.product_qty, 100 / 1120, places=12)
+        self.assertAlmostEqual(legacy_bom.bom_line_ids.product_qty, 100 / 1120, places=6)
         self.assertEqual(
             legacy_bom.bom_line_ids.softlife_conversion_audit,
             '100 g / 1120 g = 0.0892857143 unit',

@@ -216,7 +216,10 @@ class SoftlifeRecipeSync(models.Model):
             product = component['product']
             line = by_product.get(product.id)
             if not line or line.product_uom_id != component['uom'] \
-                    or abs(line.product_qty - component['quantity']) > 1e-9 \
+                    or float_compare(
+                        line.product_qty, component['quantity'],
+                        precision_rounding=component['uom'].rounding,
+                    ) != 0 \
                     or abs(line.softlife_dosage_quantity - component['dosage_quantity']) > 1e-9 \
                     or line.softlife_dosage_uom != component['dosage_uom'] \
                     or abs(line.softlife_stock_quantity_per_unit - component['quantity']) > 1e-9 \
