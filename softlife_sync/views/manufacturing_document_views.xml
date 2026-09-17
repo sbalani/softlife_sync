@@ -17,4 +17,22 @@
             </xpath>
         </field>
     </record>
+
+    <record id="stock_picking_form_softlife_replenishment" model="ir.ui.view">
+        <field name="name">stock.picking.form.softlife.replenishment</field>
+        <field name="model">stock.picking</field>
+        <field name="inherit_id" ref="stock.view_picking_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//notebook" position="inside">
+                <page string="SoftLife Replenishment" invisible="not softlife_replenishment_key">
+                    <group>
+                        <field name="softlife_replenishment_key" readonly="1"/>
+                        <field name="softlife_export_id" readonly="1"/>
+                        <field name="softlife_transfer_key" readonly="1"/>
+                        <field name="softlife_payload_sha256" readonly="1"/>
+                    </group>
+                </page>
+            </xpath>
+        </field>
+    </record>
 </odoo>

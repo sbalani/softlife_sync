@@ -214,7 +214,8 @@ class SoftlifeSyncClient(models.TransientModel):
     def sync_odoo_warehouses(self):
         Warehouse = self.env['stock.warehouse']
         rows = [
-            {'odoo_id': w.id, 'name': w.name, 'code': w.code}
+            {'odoo_id': w.id, 'name': w.name, 'code': w.code,
+             'stock_location_id': w.lot_stock_id.id if w.lot_stock_id else None}
             for w in Warehouse.search([])
         ]
         self._rest_upsert('odoo_warehouses', rows, on_conflict='odoo_id')
@@ -233,6 +234,8 @@ class SoftlifeSyncClient(models.TransientModel):
                 'barcode': p.barcode or None,
                 'category': p.categ_id.display_name if p.categ_id else None,
                 'uom': p.uom_id.name if p.uom_id else None,
+                'uom_rounding': p.uom_id.rounding if p.uom_id else 0.01,
+                'tracking': p.tracking,
                 'qty_available': p.qty_available,
                 'package_content_quantity': p.package_content_quantity or None,
                 'package_content_uom': p.package_content_uom or None,
@@ -271,31 +274,56 @@ class SoftlifeSyncClient(models.TransientModel):
 
     @api.model
     def sync_odoo_lot_stock(self):
-        quantities = {}
+        lot_quantities = {}
+        product_quantities = {}
         for quant in self.env['stock.quant'].search([
-            ('lot_id', '!=', False),
             ('location_id.usage', '=', 'internal'),
         ]):
             warehouse = quant.location_id.warehouse_id
             if not warehouse:
                 continue
-            key = (quant.lot_id.id, warehouse.id)
-            quantities[key] = quantities.get(key, 0.0) + quant.quantity
+            product_key = (quant.product_id.id, warehouse.id)
+            current = product_quantities.get(product_key, [0.0, 0.0, 0.0])
+            current[0] += quant.quantity
+            current[1] += quant.reserved_quantity
+            current[2] = max(0.0, current[0] - current[1])
+            product_quantities[product_key] = current
+            if quant.lot_id:
+                lot_key = (quant.lot_id.id, warehouse.id)
+                lot_current = lot_quantities.get(lot_key, [0.0, 0.0])
+                lot_current[0] += quant.quantity
+                lot_current[1] += quant.reserved_quantity
+                lot_quantities[lot_key] = lot_current
         rows = [
             {
                 'odoo_lot_id': lot_id,
                 'odoo_warehouse_id': warehouse_id,
-                'qty': quantity,
+                'qty': quantities[0],
+                'available_qty': max(0.0, quantities[0] - quantities[1]),
             }
-            for (lot_id, warehouse_id), quantity in sorted(quantities.items())
-            if math.isfinite(quantity) and quantity > 0
+            for (lot_id, warehouse_id), quantities in sorted(lot_quantities.items())
+            if all(math.isfinite(quantity) for quantity in quantities) and quantities[0] > 0
+        ]
+        product_rows = [
+            {
+                'odoo_product_id': product_id,
+                'odoo_warehouse_id': warehouse_id,
+                'quantity': quantities[0],
+                'reserved_quantity': quantities[1],
+                'available_quantity': quantities[2],
+            }
+            for (product_id, warehouse_id), quantities in sorted(product_quantities.items())
+            if all(math.isfinite(quantity) for quantity in quantities) and quantities[0] >= 0
         ]
         self._api_request(
             'POST',
             '/api/internal/odoo/lot-stock-snapshot',
-            payload={'rows': rows, 'reflected_references': []},
+            payload={
+                'rows': rows, 'product_rows': product_rows, 'reflected_references': [],
+                'observed_at': fields.Datetime.now().isoformat() + 'Z',
+            },
         )
-        return len(rows)
+        return len(product_rows)
 
     @api.model
     def sync_machines(self):

@@ -28,6 +28,10 @@
                             class="btn-primary" invisible="initiated_by != 'odoo' or platform_status != 'draft'"/>
                     <button name="action_process" type="object" string="Process"
                             class="btn-primary" invisible="platform_status not in ('ready', 'failed') or processing_state in ('processing', 'result_pending', 'completed')"/>
+                    <button name="action_process_replenishment" type="object" string="Replenish"
+                            class="btn-primary" invisible="platform_status != 'replenishment_ready' or replenishment_state in ('processing', 'result_pending', 'completed')"/>
+                    <button name="action_retry_replenishment_callback" type="object" string="Send / Retry Replenishment Result"
+                            invisible="replenishment_state != 'result_pending'"/>
                     <button name="action_retry_callback" type="object" string="Send / Retry Result"
                             invisible="processing_state != 'result_pending'"/>
                     <field name="processing_state" widget="statusbar"/>
@@ -39,6 +43,7 @@
                             <field name="idempotency_key"/>
                             <field name="initiated_by"/>
                             <field name="platform_status"/>
+                            <field name="replenishment_state"/>
                         </group>
                         <group>
                             <field name="period_from"/>
@@ -52,6 +57,11 @@
                         <page string="Preview"><field name="payload" widget="json" nolabel="1"/></page>
                         <page string="Blocked Details"><field name="blocked_items" widget="json" nolabel="1"/></page>
                         <page string="Result"><field name="result_payload" widget="json" nolabel="1"/></page>
+                        <page string="Replenishment">
+                            <field name="replenishment_result" widget="json" nolabel="1"/>
+                            <field name="replenishment_error" nolabel="1"/>
+                            <field name="replenishment_callback_error" nolabel="1"/>
+                        </page>
                         <page string="Errors">
                             <field name="error" nolabel="1"/>
                             <field name="callback_error" nolabel="1"/>

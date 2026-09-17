@@ -40,6 +40,20 @@ class MrpProduction(models.Model):
     ]
 
 
+class StockPicking(models.Model):
+    _inherit = 'stock.picking'
+
+    softlife_replenishment_key = fields.Char(index=True, copy=False)
+    softlife_export_id = fields.Char(index=True, copy=False)
+    softlife_transfer_key = fields.Char(index=True, copy=False)
+    softlife_payload_sha256 = fields.Char(copy=False)
+
+    _sql_constraints = [
+        ('softlife_replenishment_key_unique', 'unique(softlife_replenishment_key)',
+         'This SoftLife replenishment transfer has already been created.'),
+    ]
+
+
 class SaleOrder(models.Model):
     _inherit = 'sale.order'
 

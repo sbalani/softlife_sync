@@ -351,6 +351,14 @@ class SoftlifeManufacturingRun(models.Model):
     payload = fields.Json(readonly=True)
     blocked_items = fields.Json(readonly=True)
     platform_result = fields.Json(readonly=True)
+    replenishment_state = fields.Selection([
+        ('not_required', 'Not Required'), ('pending', 'Pending'),
+        ('processing', 'Processing'), ('result_pending', 'Result Pending'),
+        ('completed', 'Completed'), ('failed', 'Failed'),
+    ], default='not_required', required=True, index=True, readonly=True)
+    replenishment_result = fields.Json(readonly=True)
+    replenishment_error = fields.Text(readonly=True)
+    replenishment_callback_error = fields.Text(readonly=True)
     processing_state = fields.Selection([
         ('new', 'Not Processed'), ('processing', 'Processing'),
         ('result_pending', 'Result Pending'), ('completed', 'Completed'), ('failed', 'Failed'),
@@ -376,22 +384,37 @@ class SoftlifeManufacturingRun(models.Model):
         return fields.Datetime.to_string(parsed)
 
     @api.model
-    def _remote_values(self, remote):
-        return {
-            'export_id': remote.get('export_id'), 'idempotency_key': remote.get('idempotency_key'),
-            'initiated_by': remote.get('initiated_by'), 'platform_status': remote.get('status'),
-            'period_from': self._utc_datetime(remote.get('period_from')),
-            'period_to': self._utc_datetime(remote.get('period_to')),
-            'time_zone': remote.get('time_zone'), 'document_date': remote.get('document_date'),
-            'payload_sha256': remote.get('payload_sha256'),
-            'payload': {
-                'payload_contract_version': remote.get('payload_contract_version'),
-                'manufacturing_contract_version': remote.get('manufacturing_contract_version'),
-                'warehouses': remote.get('warehouses') or [],
-            },
-            'blocked_items': remote.get('blocked_items') or [],
-            'platform_result': remote.get('odoo_result') or False,
+    def _remote_values(self, remote, current_payload=None):
+        values = {}
+        direct = {
+            'export_id': 'export_id', 'idempotency_key': 'idempotency_key',
+            'initiated_by': 'initiated_by', 'status': 'platform_status',
+            'time_zone': 'time_zone', 'document_date': 'document_date',
+            'payload_sha256': 'payload_sha256', 'blocked_items': 'blocked_items',
+            'odoo_result': 'platform_result',
         }
+        for remote_key, field_name in direct.items():
+            if remote_key in remote:
+                if remote_key == 'blocked_items':
+                    values[field_name] = remote.get(remote_key) or []
+                elif remote_key == 'odoo_result':
+                    values[field_name] = remote.get(remote_key) or False
+                else:
+                    values[field_name] = remote.get(remote_key)
+        for remote_key, field_name in (('period_from', 'period_from'), ('period_to', 'period_to')):
+            if remote_key in remote:
+                values[field_name] = self._utc_datetime(remote.get(remote_key))
+        payload_fields = (
+            'payload_contract_version', 'manufacturing_contract_version',
+            'warehouses', 'replenishment',
+        )
+        if any(key in remote for key in payload_fields):
+            payload = dict(current_payload or {})
+            for key in payload_fields:
+                if key in remote:
+                    payload[key] = remote.get(key) or ([] if key == 'warehouses' else False)
+            values['payload'] = payload
+        return values
 
     @api.model
     def upsert_remote(self, remote):
@@ -399,13 +422,23 @@ class SoftlifeManufacturingRun(models.Model):
         if not export_id:
             raise ValidationError(_('Platform run omitted export_id.'))
         run = self.search([('export_id', '=', export_id)], limit=1)
-        values = self._remote_values(remote)
+        values = self._remote_values(remote, run.payload if run else None)
         if run:
             if run.payload_sha256 and values['payload_sha256'] and run.payload_sha256 != values['payload_sha256']:
                 raise ValidationError(_('Platform changed the immutable payload hash for %s.') % export_id)
             run.write(values)
         else:
+            if remote.get('status') == 'replenishment_ready':
+                values['replenishment_state'] = 'pending'
+            elif remote.get('status') == 'replenishment_failed':
+                values['replenishment_state'] = 'failed'
             run = self.create(values)
+        if remote.get('status') == 'replenishment_ready' \
+                and run.replenishment_state in ('not_required', 'failed'):
+            run.replenishment_state = 'pending'
+        elif remote.get('status') == 'replenishment_failed' \
+                and run.replenishment_state not in ('completed', 'result_pending'):
+            run.replenishment_state = 'failed'
         if remote.get('status') == 'completed' and run.processing_state == 'result_pending':
             run.processing_state = 'completed'
         elif remote.get('status') == 'completed' and remote.get('odoo_result') and run.processing_state == 'new':
@@ -565,6 +598,14 @@ class SoftlifeManufacturingRun(models.Model):
             int(warehouse.get('odoo_warehouse_id') or 0)
             for warehouse in (self.payload or {}).get('warehouses') or []
         } - {0}
+        replenishment = (self.payload or {}).get('replenishment') or {}
+        warehouse_ids.update({
+            int(warehouse_id or 0)
+            for transfer in replenishment.get('transfers') or []
+            for warehouse_id in (
+                transfer.get('source_warehouse_id'), transfer.get('destination_warehouse_id'),
+            )
+        } - {0})
         if not warehouse_ids:
             return
         warehouses = self.env['stock.warehouse'].browse(sorted(warehouse_ids)).exists()
@@ -821,11 +862,301 @@ class SoftlifeManufacturingRun(models.Model):
             'error': None,
         }
 
+    def _replenishment_external_key(self, transfer_key):
+        self.ensure_one()
+        return '%s:replenishment:%s' % (self.idempotency_key or self.export_id, transfer_key)
+
+    def _validate_existing_replenishment(self, picking, values):
+        self.ensure_one()
+        move = picking.move_ids
+        if picking.state != 'done' or len(move) != 1 \
+                or picking.picking_type_id != values['source'].int_type_id \
+                or picking.location_id != values['source'].lot_stock_id \
+                or picking.location_dest_id != values['destination'].lot_stock_id \
+                or move.product_id != values['product'] \
+                or move.product_uom != values['uom'] \
+                or float_compare(
+                    move.product_uom_qty, values['quantity'],
+                    precision_rounding=values['uom'].rounding,
+                ):
+            raise ValidationError(_(
+                'Existing replenishment transfer %s does not match the immutable payload.'
+            ) % values['transfer_key'])
+        actual_lots = {}
+        for line in move.move_line_ids:
+            if line.lot_id:
+                actual_lots[line.lot_id.id] = actual_lots.get(line.lot_id.id, 0.0) + line.quantity
+        expected_lots = {lot.id: quantity for lot, quantity in values['lots']}
+        actual_quantity = sum(move.move_line_ids.mapped('quantity'))
+        if set(actual_lots) != set(expected_lots) or any(
+            float_compare(actual_lots[lot_id], quantity, precision_rounding=values['uom'].rounding)
+            for lot_id, quantity in expected_lots.items()
+        ) or float_compare(actual_quantity, values['quantity'], precision_rounding=values['uom'].rounding):
+            raise ValidationError(_(
+                'Existing replenishment transfer %s does not match the selected lots.'
+            ) % values['transfer_key'])
+
+    def _replenishment_values(self):
+        self.ensure_one()
+        replenishment = (self.payload or {}).get('replenishment') or {}
+        if not replenishment.get('required') or not replenishment.get('plan_complete'):
+            raise ValidationError(_('Replenishment-ready run does not contain a complete required plan.'))
+        source_warehouse_id = int(replenishment.get('source_warehouse_id') or 0)
+        if not source_warehouse_id:
+            raise ValidationError(_('Replenishment source_warehouse_id is required.'))
+        transfers = replenishment.get('transfers') or []
+        if not transfers:
+            raise ValidationError(_('Replenishment-ready run has no transfers.'))
+        result = []
+        seen_keys = set()
+        Recipe = self.env['softlife.recipe.sync']
+        for transfer in transfers:
+            transfer_key = str(transfer.get('transfer_key') or '')
+            if not transfer_key or transfer_key in seen_keys:
+                raise ValidationError(_('Every replenishment transfer_key must be present and unique.'))
+            seen_keys.add(transfer_key)
+            transfer_source_id = int(transfer.get('source_warehouse_id') or 0)
+            destination_id = int(transfer.get('destination_warehouse_id') or 0)
+            if transfer_source_id != source_warehouse_id:
+                raise ValidationError(_(
+                    'Transfer %s source warehouse differs from the replenishment source warehouse.'
+                ) % transfer_key)
+            source = self.env['stock.warehouse'].browse(transfer_source_id).exists()
+            destination = self.env['stock.warehouse'].browse(destination_id).exists()
+            if not source or not destination or source == destination:
+                raise ValidationError(_('Transfer %s references invalid warehouses.') % transfer_key)
+            if source.company_id != destination.company_id or source.company_id != self.env.company:
+                raise ValidationError(_('Transfer %s warehouses must belong to the active company.') % transfer_key)
+            if not source.lot_stock_id or not destination.lot_stock_id or not source.int_type_id:
+                raise ValidationError(_('Transfer %s warehouses are not configured for internal transfers.') % transfer_key)
+            product_id = int(transfer.get('odoo_product_id') or 0)
+            product = self.env['product.product'].browse(product_id).exists()
+            if not product:
+                raise ValidationError(_('Transfer %s references a missing product.') % transfer_key)
+            uom = Recipe._uom(transfer.get('stock_uom'), product)
+            if uom != product.uom_id:
+                raise ValidationError(_(
+                    'Transfer %(transfer)s stock UoM must equal %(uom)s.',
+                    transfer=transfer_key, uom=product.uom_id.display_name,
+                ))
+            quantity = float(transfer.get('quantity') or 0)
+            if float_compare(quantity, 0.0, precision_rounding=uom.rounding) <= 0:
+                raise ValidationError(_('Transfer %s quantity must be positive.') % transfer_key)
+            lots = []
+            seen_lots = set()
+            for selected in transfer.get('lots') or []:
+                lot_id = int(selected.get('odoo_lot_id') or 0)
+                lot_quantity = float(selected.get('quantity') or 0)
+                lot = self.env['stock.lot'].browse(lot_id).exists()
+                if not lot or lot.product_id != product or lot_id in seen_lots \
+                        or float_compare(lot_quantity, 0.0, precision_rounding=uom.rounding) <= 0:
+                    raise ValidationError(_('Transfer %s contains an invalid selected lot.') % transfer_key)
+                seen_lots.add(lot_id)
+                lots.append((lot, lot_quantity))
+            if product.tracking != 'none' and not lots:
+                raise ValidationError(_(
+                    'Transfer %s requires manually selected source lots.'
+                ) % transfer_key)
+            if product.tracking == 'none' and lots:
+                raise ValidationError(_('Untracked transfer %s cannot contain source lots.') % transfer_key)
+            if lots and float_compare(
+                sum(lot_quantity for _lot, lot_quantity in lots), quantity,
+                precision_rounding=uom.rounding,
+            ):
+                raise ValidationError(_(
+                    'Transfer %s selected lot quantities must equal the whole requested quantity.'
+                ) % transfer_key)
+            result.append({
+                'transfer_key': transfer_key,
+                'external_key': self._replenishment_external_key(transfer_key),
+                'source': source, 'destination': destination,
+                'product': product, 'uom': uom, 'quantity': quantity, 'lots': lots,
+            })
+        return result
+
+    def _create_replenishment_picking(self, values, document_datetime):
+        self.ensure_one()
+        Picking = self.env['stock.picking']
+        existing = Picking.search([
+            ('softlife_replenishment_key', '=', values['external_key']),
+        ], limit=1)
+        if existing:
+            self._validate_existing_replenishment(existing, values)
+            return existing
+
+        quant_ids = self.env['stock.quant'].search([
+            ('product_id', '=', values['product'].id),
+            ('location_id', 'child_of', values['source'].lot_stock_id.id),
+            *([('lot_id', 'in', [lot.id for lot, _quantity in values['lots']])]
+              if values['lots'] else []),
+        ]).ids
+        if quant_ids:
+            self.env.cr.execute('SELECT id FROM stock_quant WHERE id IN %s FOR UPDATE', [tuple(quant_ids)])
+        Quant = self.env['stock.quant']
+        for lot, quantity in values['lots']:
+            available = Quant._get_available_quantity(
+                values['product'], values['source'].lot_stock_id, lot_id=lot, strict=False,
+            )
+            if float_compare(available, quantity, precision_rounding=values['uom'].rounding) < 0:
+                raise ValidationError(_(
+                    'Transfer %(transfer)s lot %(lot)s has %(available)s available; %(required)s is required.',
+                    transfer=values['transfer_key'], lot=lot.display_name,
+                    available=available, required=quantity,
+                ))
+
+        picking = Picking.create({
+            'picking_type_id': values['source'].int_type_id.id,
+            'location_id': values['source'].lot_stock_id.id,
+            'location_dest_id': values['destination'].lot_stock_id.id,
+            'origin': self.export_id,
+            'softlife_replenishment_key': values['external_key'],
+            'softlife_export_id': self.export_id,
+            'softlife_transfer_key': values['transfer_key'],
+            'softlife_payload_sha256': self.payload_sha256,
+            'move_ids': [Command.create({
+                'name': values['product'].display_name,
+                'product_id': values['product'].id,
+                'product_uom_qty': values['quantity'],
+                'product_uom': values['uom'].id,
+                'location_id': values['source'].lot_stock_id.id,
+                'location_dest_id': values['destination'].lot_stock_id.id,
+            })],
+        })
+        picking.action_confirm()
+        move = picking.move_ids
+        if move.move_line_ids:
+            move._do_unreserve()
+        allocations = values['lots'] or [(False, values['quantity'])]
+        for lot, quantity in allocations:
+            reserve_kwargs = {'lot_id': lot} if lot else {}
+            reserved = move._update_reserved_quantity(
+                quantity, values['source'].lot_stock_id, strict=False, **reserve_kwargs,
+            )
+            if float_compare(reserved, quantity, precision_rounding=values['uom'].rounding):
+                raise ValidationError(_(
+                    'Transfer %(transfer)s could not fully reserve %(lot)s.',
+                    transfer=values['transfer_key'], lot=lot.display_name if lot else values['product'].display_name,
+                ))
+        reserved_lots = {}
+        for line in move.move_line_ids:
+            if line.lot_id:
+                reserved_lots[line.lot_id.id] = reserved_lots.get(line.lot_id.id, 0.0) + line.quantity
+        expected_lots = {lot.id: quantity for lot, quantity in values['lots']}
+        reserved_quantity = sum(move.move_line_ids.mapped('quantity'))
+        if set(reserved_lots) != set(expected_lots) or any(
+            float_compare(reserved_lots[lot_id], quantity, precision_rounding=values['uom'].rounding)
+            for lot_id, quantity in expected_lots.items()
+        ) or float_compare(reserved_quantity, values['quantity'], precision_rounding=values['uom'].rounding):
+            raise ValidationError(_(
+                'Transfer %s did not reserve exactly the selected lots.'
+            ) % values['transfer_key'])
+        if 'picked' in move._fields:
+            move.picked = True
+        result = picking.with_context(
+            skip_backorder=True, cancel_backorder=False, force_period_date=self.document_date,
+        ).button_validate()
+        if picking.state != 'done' and isinstance(result, dict):
+            raise UserError(_(
+                'Internal transfer %(transfer)s requires wizard %(wizard)s; no partial transfer was accepted.',
+                transfer=values['transfer_key'],
+                wizard=result.get('res_model') or result.get('name') or 'unknown',
+            ))
+        if picking.state != 'done':
+            raise UserError(_('Internal transfer %s did not reach Done.') % values['transfer_key'])
+        backorders = Picking.search([('backorder_id', '=', picking.id)])
+        if backorders:
+            raise UserError(_('Internal transfer %s created a backorder.') % values['transfer_key'])
+        picking.write({'date_done': document_datetime})
+        move.write({'date': document_datetime})
+        if 'date' in move.move_line_ids._fields:
+            move.move_line_ids.write({'date': document_datetime})
+        self._validate_existing_replenishment(picking, values)
+        return picking
+
+    def _process_replenishment(self):
+        self.ensure_one()
+        effective_date = ((self.payload or {}).get('replenishment') or {}).get('effective_date')
+        if not effective_date:
+            raise ValidationError(_('Replenishment effective_date is required.'))
+        document_datetime = fields.Datetime.to_datetime(effective_date)
+        pickings = self.env['stock.picking']
+        transfer_results = []
+        for values in self._replenishment_values():
+            picking = self._create_replenishment_picking(values, document_datetime)
+            pickings |= picking
+            transfer_results.append({
+                'transfer_key': values['transfer_key'], 'picking_id': picking.id,
+            })
+        return {
+            'payload_sha256': self.payload_sha256,
+            'accepted': True,
+            'picking_ids': pickings.ids,
+            'transfers': transfer_results,
+            'error': None,
+        }
+
+    def action_process_replenishment(self):
+        self.ensure_one()
+        self._check_active_company()
+        self.env.cr.execute(
+            'SELECT id FROM softlife_manufacturing_run WHERE id = %s FOR UPDATE NOWAIT', [self.id],
+        )
+        self.invalidate_recordset()
+        if self.platform_status != 'replenishment_ready':
+            raise UserError(_('Only replenishment-ready runs can create internal transfers.'))
+        if self.replenishment_state in ('result_pending', 'completed'):
+            return True
+        self.replenishment_state = 'processing'
+        try:
+            with self.env.cr.savepoint():
+                result = self._process_replenishment()
+            self.write({
+                'replenishment_state': 'result_pending', 'replenishment_result': result,
+                'replenishment_error': False, 'replenishment_callback_error': False,
+            })
+        except Exception as exc:
+            error = {
+                'code': 'replenishment_transfer_failed',
+                'type': type(exc).__name__,
+                'message': str(exc),
+            }
+            self.write({
+                'replenishment_state': 'result_pending',
+                'replenishment_result': {
+                    'payload_sha256': self.payload_sha256,
+                    'accepted': False, 'picking_ids': [], 'error': error,
+                },
+                'replenishment_error': str(exc), 'replenishment_callback_error': False,
+            })
+            _logger.exception('SoftLife replenishment for run %s failed', self.export_id)
+        return True
+
+    def action_retry_replenishment_callback(self):
+        client = self.env['softlife.sync.client']
+        for run in self.filtered(
+                lambda row: row.replenishment_state == 'result_pending' and row.replenishment_result):
+            try:
+                if run.replenishment_result.get('accepted') is True:
+                    client.sync_odoo_lot_stock()
+                remote = client._api_request(
+                    'POST',
+                    f'/api/internal/odoo/manufacturing-periods/{run.export_id}/replenishment-result',
+                    payload=run.replenishment_result,
+                )
+                run.upsert_remote(remote)
+                accepted = run.replenishment_result.get('accepted') is True
+                run.write({
+                    'replenishment_state': 'completed' if accepted else 'failed',
+                    'replenishment_callback_error': False,
+                })
+            except Exception as exc:
+                run.replenishment_callback_error = str(exc)
+                _logger.warning('SoftLife replenishment callback failed for %s: %s', run.export_id, exc)
+        return True
+
     def action_process(self):
         self.ensure_one()
         self._check_active_company()
-        if not self.env.context.get('softlife_catalog_synced'):
-            self.action_sync_catalog()
         self.env.cr.execute(
             'SELECT id FROM softlife_manufacturing_run WHERE id = %s FOR UPDATE NOWAIT', [self.id],
         )
@@ -837,6 +1168,8 @@ class SoftlifeManufacturingRun(models.Model):
             raise UserError(_('Only ready runs or previously rejected Odoo results can be processed.'))
         if self.processing_state in ('result_pending', 'completed'):
             return True
+        if not self.env.context.get('softlife_catalog_synced'):
+            self.action_sync_catalog()
         self.processing_state = 'processing'
         try:
             with self.env.cr.savepoint():
@@ -886,11 +1219,31 @@ class SoftlifeManufacturingRun(models.Model):
         if not self.env['softlife.sync.client']._api_is_configured():
             return
         self.search([('processing_state', '=', 'result_pending')]).action_retry_callback()
+        self.search([('replenishment_state', '=', 'result_pending')]).action_retry_replenishment_callback()
         self.env['softlife.recipe.sync'].search([('callback_state', '=', 'pending')]).action_retry_callback()
         try:
             self.action_sync_catalog()
             self.action_refresh()
+            for run in self.search([
+                ('platform_status', '=', 'replenishment_ready'),
+                ('replenishment_state', '=', 'pending'),
+            ]):
+                try:
+                    source_id = int(((run.payload or {}).get('replenishment') or {}).get('source_warehouse_id') or 0)
+                    source = self.env['stock.warehouse'].browse(source_id).exists()
+                    with self.env.cr.savepoint():
+                        (run.with_company(source.company_id) if source else run).action_process_replenishment()
+                except Exception:
+                    _logger.exception('SoftLife replenishment cron failed for %s', run.export_id)
             for run in self.search([('platform_status', '=', 'ready'), ('processing_state', '=', 'new')]):
-                run.with_context(softlife_catalog_synced=True).action_process()
+                try:
+                    warehouse_ids = [int(row.get('odoo_warehouse_id') or 0)
+                                     for row in (run.payload or {}).get('warehouses') or []]
+                    warehouse = self.env['stock.warehouse'].browse(warehouse_ids[:1]).exists()
+                    target = run.with_company(warehouse.company_id) if warehouse else run
+                    with self.env.cr.savepoint():
+                        target.with_context(softlife_catalog_synced=True).action_process()
+                except Exception:
+                    _logger.exception('SoftLife manufacturing cron failed for %s', run.export_id)
         except Exception:
             _logger.exception('SoftLife manufacturing cron pass failed')

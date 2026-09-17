@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from odoo.tests.common import TransactionCase
 
@@ -14,17 +14,19 @@ class TestLotStockSnapshot(TransactionCase):
         cls.client = cls.env['softlife.sync.client']
 
     @staticmethod
-    def _quant(lot_id, warehouse_id, quantity):
+    def _quant(lot_id, warehouse_id, quantity, reserved=0.0, product_id=41):
         warehouse = SimpleNamespace(id=warehouse_id) if warehouse_id else False
         return SimpleNamespace(
             lot_id=SimpleNamespace(id=lot_id),
+            product_id=SimpleNamespace(id=product_id),
             location_id=SimpleNamespace(warehouse_id=warehouse),
             quantity=quantity,
+            reserved_quantity=reserved,
         )
 
     def test_groups_positive_internal_quantities_and_posts_complete_snapshot(self):
         quants = [
-            self._quant(12, 7, 2.5),
+            self._quant(12, 7, 2.5, reserved=0.5),
             self._quant(12, 7, 1.5),
             self._quant(11, 4, 3.0),
             self._quant(13, 7, 0.0),
@@ -41,7 +43,6 @@ class TestLotStockSnapshot(TransactionCase):
 
         self.assertEqual(count, 2)
         search.assert_called_once_with([
-            ('lot_id', '!=', False),
             ('location_id.usage', '=', 'internal'),
         ])
         request.assert_called_once_with(
@@ -49,10 +50,15 @@ class TestLotStockSnapshot(TransactionCase):
             '/api/internal/odoo/lot-stock-snapshot',
             payload={
                 'rows': [
-                    {'odoo_lot_id': 11, 'odoo_warehouse_id': 4, 'qty': 3.0},
-                    {'odoo_lot_id': 12, 'odoo_warehouse_id': 7, 'qty': 4.0},
+                    {'odoo_lot_id': 11, 'odoo_warehouse_id': 4, 'qty': 3.0, 'available_qty': 3.0},
+                    {'odoo_lot_id': 12, 'odoo_warehouse_id': 7, 'qty': 4.0, 'available_qty': 3.5},
+                ],
+                'product_rows': [
+                    {'odoo_product_id': 41, 'odoo_warehouse_id': 4, 'quantity': 3.0, 'reserved_quantity': 0.0, 'available_quantity': 3.0},
+                    {'odoo_product_id': 41, 'odoo_warehouse_id': 7, 'quantity': 4.0, 'reserved_quantity': 0.5, 'available_quantity': 3.5},
                 ],
                 'reflected_references': [],
+                'observed_at': ANY,
             },
         )
 
@@ -67,7 +73,7 @@ class TestLotStockSnapshot(TransactionCase):
         request.assert_called_once_with(
             'POST',
             '/api/internal/odoo/lot-stock-snapshot',
-            payload={'rows': [], 'reflected_references': []},
+            payload={'rows': [], 'product_rows': [], 'reflected_references': [], 'observed_at': ANY},
         )
 
     def _summary_with_lot_stock_error(self, error):
