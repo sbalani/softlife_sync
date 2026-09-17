@@ -17,9 +17,9 @@ class ResConfigSettings(models.TransientModel):
         string='Odoo Sync Secret', config_parameter='softlife.sync.odoo_sync_secret',
     )
     softlife_default_partner_id = fields.Many2one(
-        'res.partner', string='Default customer for orders',
+        'res.partner', string='Vending Customer / Consumidor Final',
         config_parameter='softlife.sync.default_partner_id',
-        help='Customer set on invoices created from vending orders.',
+        help='Accounting customer used on Sales Orders created by manufacturing runs.',
     )
     softlife_default_product_id = fields.Many2one(
         'product.product', string='Default product for order lines',

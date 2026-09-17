@@ -1,6 +1,6 @@
 {
     'name': 'SoftLife Platform Sync',
-    'version': '18.0.4.0.5',
+    'version': '18.0.4.1.0',
     'summary': 'Synchronize SoftLife master data and manufacturing periods with Odoo.',
     'description': """
 SoftLife Platform Sync
@@ -46,6 +46,7 @@ Settings, the Platform Sync / Manufacturing menus, or scheduled crons.
         'views/res_config_settings_views.xml',
         'views/product_template_views.xml',
         'views/manufacturing_run_views.xml',
+        'views/manufacturing_document_views.xml',
         'views/menus.xml',
     ],
     'installable': True,

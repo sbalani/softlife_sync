@@ -386,6 +386,7 @@ class SoftlifeManufacturingRun(models.Model):
             'payload_sha256': remote.get('payload_sha256'),
             'payload': {
                 'payload_contract_version': remote.get('payload_contract_version'),
+                'manufacturing_contract_version': remote.get('manufacturing_contract_version'),
                 'warehouses': remote.get('warehouses') or [],
             },
             'blocked_items': remote.get('blocked_items') or [],
@@ -596,20 +597,62 @@ class SoftlifeManufacturingRun(models.Model):
                 'the manufacturing order explicitly before confirming the sale.',
             ) % product.display_name)
 
+    @api.model
+    def _manufacturing_customer(self):
+        raw_id = self.env['ir.config_parameter'].sudo().get_param('softlife.sync.default_partner_id')
+        try:
+            customer_id = int(raw_id or 0)
+        except (TypeError, ValueError):
+            customer_id = 0
+        customer = self.env['res.partner'].browse(customer_id).exists()
+        if not customer:
+            raise ValidationError(_(
+                'Configure Vending Customer / Consumidor Final in SoftLife Sync settings before processing runs.'
+            ))
+        return customer
+
+    @api.model
+    def _source_orders(self, warehouse_payload):
+        sources = []
+        seen = set()
+        for source in warehouse_payload.get('source_orders') or []:
+            if not isinstance(source, dict):
+                continue
+            values = {
+                'platform_order_id': str(source.get('platform_order_id') or ''),
+                'order_code': str(source.get('order_code') or ''),
+                'machine_id': str(source.get('machine_id') or ''),
+                'machine_imei': str(source.get('machine_imei') or ''),
+                'machine_name': str(source.get('machine_name') or ''),
+            }
+            key = values['platform_order_id'] or (
+                values['order_code'], values['machine_id'], values['machine_imei'],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(values)
+        return sorted(sources, key=lambda source: (
+            source['order_code'], source['platform_order_id'], source['machine_id'],
+        ))
+
     def _process_documents(self):
         self.ensure_one()
         warehouses = (self.payload or {}).get('warehouses') or []
         if not warehouses:
             raise ValidationError(_('Ready run has no warehouse payload.'))
+        if int((self.payload or {}).get('manufacturing_contract_version') or 0) != 2:
+            raise ValidationError(_(
+                'Manufacturing payload must use contract version 2 with generic customer and source references.'
+            ))
+        customer = self._manufacturing_customer()
         warehouse_results = []
         document_datetime = fields.Datetime.to_datetime(self.document_date)
         for warehouse_payload in warehouses:
             warehouse_id = int(warehouse_payload.get('odoo_warehouse_id') or 0)
-            customer_id = int(warehouse_payload.get('odoo_customer_id') or 0)
             warehouse = self.env['stock.warehouse'].browse(warehouse_id).exists()
-            customer = self.env['res.partner'].browse(customer_id).exists()
-            if not warehouse or not customer:
-                raise ValidationError(_('Warehouse %s or its configured customer is missing in Odoo.') % warehouse_id)
+            if not warehouse:
+                raise ValidationError(_('Warehouse %s is missing in Odoo.') % warehouse_id)
             if warehouse.company_id != self.env.company:
                 raise ValidationError(_(
                     'Warehouse %(warehouse)s belongs to %(company)s; run this process in that Odoo company.',
@@ -694,6 +737,9 @@ class SoftlifeManufacturingRun(models.Model):
                 'product_uom': product.uom_id.id, 'price_unit': totals[1] / totals[0],
                 'tax_id': [(6, 0, [])],
             }) for product, totals in sale_totals.items()]
+            source_orders = self._source_orders(warehouse_payload)
+            if not source_orders:
+                raise ValidationError(_('Warehouse %s has no frozen source-order references.') % warehouse.display_name)
             sale = self.env['sale.order'].search([
                 ('softlife_export_id', '=', self.export_id),
                 ('softlife_warehouse_id', '=', warehouse.id),
@@ -706,6 +752,7 @@ class SoftlifeManufacturingRun(models.Model):
                     'client_order_ref': self.export_id,
                     'softlife_export_id': self.export_id,
                     'softlife_warehouse_id': warehouse.id,
+                    'softlife_source_orders': source_orders,
                     'order_line': order_lines,
                 })
                 sale.action_confirm()
@@ -714,6 +761,8 @@ class SoftlifeManufacturingRun(models.Model):
                     or sale.partner_id != customer or sale.warehouse_id != warehouse:
                 raise ValidationError(_('Existing sale order does not match the immutable payload.'))
             else:
+                if sale.softlife_source_orders != source_orders:
+                    raise ValidationError(_('Existing sale order source references do not match the immutable payload.'))
                 expected = {
                     (values[2]['product_id'], values[2]['product_uom']): (
                         values[2]['product_uom_qty'], values[2]['price_unit'],

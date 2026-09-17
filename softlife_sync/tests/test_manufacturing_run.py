@@ -11,10 +11,12 @@ class TestManufacturingRun(TransactionCase):
             'export_id': 'export-1',
             'period_from': '2026-07-08T22:00:00+00:00',
             'period_to': '2026-07-10T00:00:00+02:00',
+            'manufacturing_contract_version': 2,
         })
 
         self.assertEqual(values['period_from'], '2026-07-08 22:00:00')
         self.assertEqual(values['period_to'], '2026-07-09 22:00:00')
+        self.assertEqual(values['payload']['manufacturing_contract_version'], 2)
 
     def test_remote_values_reject_invalid_datetime(self):
         with self.assertRaisesRegex(ValidationError, 'invalid datetime'):
@@ -41,6 +43,14 @@ class TestManufacturingRun(TransactionCase):
         with self.assertRaisesRegex(UserError, 'Switch the active Odoo company'):
             run._check_active_company()
 
+    def test_processing_rejects_legacy_manufacturing_contract(self):
+        run = self.env['softlife.manufacturing.run'].new({
+            'payload': {'manufacturing_contract_version': 1, 'warehouses': [{}]},
+        })
+
+        with self.assertRaisesRegex(ValidationError, 'contract version 2'):
+            run._process_documents()
+
     def test_repeated_rejection_does_not_replace_platform_result(self):
         run = self.env['softlife.manufacturing.run'].create({
             'export_id': 'export-retry',
@@ -57,3 +67,31 @@ class TestManufacturingRun(TransactionCase):
         request.assert_not_called()
         self.assertEqual(run.processing_state, 'failed')
         self.assertFalse(run.callback_error)
+
+    def test_manufacturing_customer_uses_configured_vending_partner(self):
+        partner = self.env['res.partner'].create({'name': 'Consumidor Final'})
+        self.env['ir.config_parameter'].sudo().set_param('softlife.sync.default_partner_id', partner.id)
+
+        customer = self.env['softlife.manufacturing.run']._manufacturing_customer()
+
+        self.assertEqual(customer, partner)
+
+    def test_manufacturing_customer_requires_configuration(self):
+        self.env['ir.config_parameter'].sudo().set_param('softlife.sync.default_partner_id', '')
+
+        with self.assertRaisesRegex(ValidationError, 'Vending Customer / Consumidor Final'):
+            self.env['softlife.manufacturing.run']._manufacturing_customer()
+
+    def test_source_orders_preserve_order_to_machine_mapping(self):
+        run = self.env['softlife.manufacturing.run']
+        sources = run._source_orders({'source_orders': [{
+            'platform_order_id': 'order-id', 'order_code': 'S00124',
+            'machine_id': 'machine-id', 'machine_imei': '860000000000001',
+            'machine_name': 'Flowers',
+        }]})
+
+        self.assertEqual(sources[0]['order_code'], 'S00124')
+        self.assertEqual(sources[0]['machine_id'], 'machine-id')
+        sale = self.env['sale.order'].new({'softlife_source_orders': sources})
+        sale._compute_softlife_source_summary()
+        self.assertIn('S00124 - Flowers', sale.softlife_source_summary)

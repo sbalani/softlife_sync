@@ -22,6 +22,10 @@
                             <setting id="softlife_odoo_secret" string="Odoo Sync Secret">
                                 <field name="softlife_odoo_sync_secret" password="True"/>
                             </setting>
+                            <setting id="softlife_vending_customer" string="Vending Customer / Consumidor Final"
+                                     help="Accounting customer used on Sales Orders created by manufacturing runs.">
+                                <field name="softlife_default_partner_id"/>
+                            </setting>
                             <setting id="softlife_last" string="Last sync">
                                 <field name="softlife_last_sync" readonly="1"/>
                                 <field name="softlife_last_sync_summary" readonly="1"/>

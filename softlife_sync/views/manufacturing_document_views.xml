@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="sale_order_form_softlife_sources" model="ir.ui.view">
+        <field name="name">sale.order.form.softlife.sources</field>
+        <field name="model">sale.order</field>
+        <field name="inherit_id" ref="sale.view_order_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//notebook" position="inside">
+                <page string="SoftLife Sources" invisible="not softlife_export_id">
+                    <group>
+                        <field name="softlife_export_id" readonly="1"/>
+                        <field name="softlife_warehouse_id" readonly="1"/>
+                    </group>
+                    <field name="softlife_source_summary" readonly="1" nolabel="1"/>
+                    <field name="softlife_source_orders" readonly="1" widget="json" nolabel="1"/>
+                </page>
+            </xpath>
+        </field>
+    </record>
+</odoo>

@@ -1,4 +1,4 @@
-from odoo import fields, models
+from odoo import api, fields, models
 
 
 class MrpBom(models.Model):
@@ -45,6 +45,22 @@ class SaleOrder(models.Model):
 
     softlife_export_id = fields.Char(index=True, copy=False)
     softlife_warehouse_id = fields.Many2one('stock.warehouse', copy=False)
+    softlife_source_orders = fields.Json(copy=False)
+    softlife_source_summary = fields.Text(compute='_compute_softlife_source_summary')
+
+    @api.depends('softlife_source_orders')
+    def _compute_softlife_source_summary(self):
+        for order in self:
+            order.softlife_source_summary = '\n'.join(
+                '%s - %s (machine %s, IMEI %s)' % (
+                    source.get('order_code') or source.get('platform_order_id') or 'Unknown order',
+                    source.get('machine_name') or 'Unknown machine',
+                    source.get('machine_id') or 'unknown',
+                    source.get('machine_imei') or 'unknown',
+                )
+                for source in (order.softlife_source_orders or [])
+                if isinstance(source, dict)
+            )
 
     _sql_constraints = [
         ('softlife_sale_order_unique', 'unique(softlife_export_id, softlife_warehouse_id)',
