@@ -80,3 +80,9 @@ class SaleOrder(models.Model):
         ('softlife_sale_order_unique', 'unique(softlife_export_id, softlife_warehouse_id)',
          'This SoftLife warehouse-period sale order already exists.'),
     ]
+
+
+class SaleOrderLine(models.Model):
+    _inherit = 'sale.order.line'
+
+    softlife_rounding_adjustment = fields.Boolean(copy=False)

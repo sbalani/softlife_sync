@@ -133,6 +133,34 @@ class TestManufacturingRun(TransactionCase):
         sale._compute_softlife_source_summary()
         self.assertIn('S00124 - Flowers', sale.softlife_source_summary)
 
+    def test_sales_rounding_adjustment_reconciles_exact_currency_total(self):
+        currency = self.env.company.currency_id
+        partner = self.env['res.partner'].create({'name': 'Rounding Customer'})
+        product = self.env['product.product'].create({
+            'name': 'Rounding Test Product', 'type': 'service',
+        })
+        sale = self.env['sale.order'].create({
+            'partner_id': partner.id,
+            'order_line': [(0, 0, {
+                'product_id': product.id,
+                'product_uom_qty': 3,
+                'price_unit': 2.67,
+                'tax_id': [(6, 0, [])],
+            })],
+        })
+
+        difference = self.env['softlife.manufacturing.run']._add_sales_rounding_adjustment(
+            sale, 8.00, currency,
+        )
+
+        adjustment = sale.order_line.filtered('softlife_rounding_adjustment')
+        self.assertEqual(difference, -0.01)
+        self.assertEqual(len(adjustment), 1)
+        self.assertEqual(adjustment.product_id.default_code, 'SOFTLIFE-ROUNDING')
+        self.assertEqual(adjustment.product_id.type, 'service')
+        self.assertEqual(adjustment.tax_id, self.env['account.tax'])
+        self.assertEqual(currency.round(sale.amount_total), 8.00)
+
     def _replenishment_records(self):
         source = self.env['stock.warehouse'].search([
             ('company_id', '=', self.env.company.id),

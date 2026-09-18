@@ -677,6 +677,36 @@ class SoftlifeManufacturingRun(models.Model):
             source['order_code'], source['platform_order_id'], source['machine_id'],
         ))
 
+    @api.model
+    def _add_sales_rounding_adjustment(self, sale, expected_gross, currency):
+        difference = currency.round(expected_gross - sale.amount_total)
+        if currency.is_zero(difference):
+            return False
+        Product = self.env['product.product'].with_context(active_test=False)
+        product = Product.search([('default_code', '=', 'SOFTLIFE-ROUNDING')], limit=1)
+        if product and product.type != 'service':
+            raise ValidationError(_('SOFTLIFE-ROUNDING must be an Odoo service product.'))
+        if not product:
+            product = Product.create({
+                'name': 'SoftLife Sales Rounding Adjustment',
+                'default_code': 'SOFTLIFE-ROUNDING',
+                'type': 'service',
+                'sale_ok': True,
+                'purchase_ok': False,
+            })
+        elif not product.active:
+            product.active = True
+        sale.write({'order_line': [(0, 0, {
+            'name': product.display_name,
+            'product_id': product.id,
+            'product_uom_qty': 1,
+            'product_uom': product.uom_id.id,
+            'price_unit': difference,
+            'tax_id': [(6, 0, [])],
+            'softlife_rounding_adjustment': True,
+        })]})
+        return difference
+
     def _process_documents(self):
         self.ensure_one()
         warehouses = (self.payload or {}).get('warehouses') or []
@@ -778,6 +808,7 @@ class SoftlifeManufacturingRun(models.Model):
                 'product_uom': product.uom_id.id, 'price_unit': totals[1] / totals[0],
                 'tax_id': [(6, 0, [])],
             }) for product, totals in sale_totals.items()]
+            expected_gross = currency.round(sum(totals[1] for totals in sale_totals.values()))
             source_orders = self._source_orders(warehouse_payload)
             if not source_orders:
                 raise ValidationError(_('Warehouse %s has no frozen source-order references.') % warehouse.display_name)
@@ -796,6 +827,7 @@ class SoftlifeManufacturingRun(models.Model):
                     'softlife_source_orders': source_orders,
                     'order_line': order_lines,
                 })
+                self._add_sales_rounding_adjustment(sale, expected_gross, currency)
                 sale.action_confirm()
                 self._complete_sale_deliveries(sale, document_datetime)
             elif sale.state not in ('sale', 'done') or sale.currency_id != currency \
@@ -809,9 +841,11 @@ class SoftlifeManufacturingRun(models.Model):
                         values[2]['product_uom_qty'], values[2]['price_unit'],
                     ) for values in order_lines
                 }
+                main_lines = sale.order_line.filtered(
+                    lambda line: not line.display_type and not line.softlife_rounding_adjustment)
                 actual = {(line.product_id.id, line.product_uom.id): (
                     line.product_uom_qty, line.price_unit,
-                ) for line in sale.order_line.filtered(lambda line: not line.display_type)}
+                ) for line in main_lines}
                 if set(expected) != set(actual) or any(
                     float_compare(
                         actual[key][0], values[0],
@@ -821,17 +855,24 @@ class SoftlifeManufacturingRun(models.Model):
                     for key, values in expected.items()
                 ):
                     raise ValidationError(_('Existing sale order lines do not match the immutable payload.'))
+                adjustments = sale.order_line.filtered(
+                    lambda line: not line.display_type and line.softlife_rounding_adjustment)
+                if len(adjustments) > 1 or adjustments and (
+                        adjustments.product_id.default_code != 'SOFTLIFE-ROUNDING'
+                        or adjustments.product_id.type != 'service'
+                        or float_compare(adjustments.product_uom_qty, 1.0,
+                                         precision_rounding=adjustments.product_uom.rounding)):
+                    raise ValidationError(_('Existing sales rounding adjustment is invalid.'))
                 if sale.order_line.filtered(lambda line: not line.display_type and line.tax_id):
                     raise ValidationError(_('Existing sale order has taxes but the frozen export is gross sales.'))
                 self._complete_sale_deliveries(sale, document_datetime)
-            expected_gross = sum(totals[1] for totals in sale_totals.values())
             if float_compare(sale.amount_total, expected_gross, precision_rounding=currency.rounding):
                 raise ValidationError(_(
                     'Sales order %(sale)s total %(actual)s does not match platform gross sales %(expected)s.',
                     sale=sale.display_name, actual=sale.amount_total, expected=expected_gross,
                 ))
             incomplete_lines = sale.order_line.filtered(
-                lambda line: not line.display_type and float_compare(
+                lambda line: not line.display_type and not line.softlife_rounding_adjustment and float_compare(
                     line.qty_delivered, line.product_uom_qty,
                     precision_rounding=line.product_uom.rounding,
                 ) != 0
