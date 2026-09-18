@@ -2,6 +2,7 @@
 into Odoo. Odoo is the downstream ERP; the middleware is the system of record.
 """
 import datetime
+import json
 import logging
 import math
 from urllib.parse import urljoin
@@ -25,6 +26,8 @@ class SoftlifeAPIError(UserError):
 class SoftlifeSyncClient(models.TransientModel):
     _name = 'softlife.sync.client'
     _description = 'SoftLife Platform Sync (Supabase connector)'
+    _sync_lock_id = 731904628
+    _pending_sync_result_key = 'softlife.sync.pending_platform_request_result'
 
     # ------------------------------------------------------------------
     # Config / HTTP
@@ -162,6 +165,11 @@ class SoftlifeSyncClient(models.TransientModel):
     # ------------------------------------------------------------------
     # Sync
     # ------------------------------------------------------------------
+    @api.model
+    def _acquire_sync_lock(self):
+        self.env.cr.execute('SELECT pg_try_advisory_xact_lock(%s)', [self._sync_lock_id])
+        return bool(self.env.cr.fetchone()[0])
+
     @api.model
     def sync_partners(self):
         rows = self._rest_get('tenants', {'select': 'id,name,kind'})
@@ -481,6 +489,8 @@ class SoftlifeSyncClient(models.TransientModel):
     def sync_all(self):
         if not self._is_configured():
             return 'Skipped: Supabase URL / key not configured.'
+        if not self._acquire_sync_lock():
+            return 'Skipped: another SoftLife full sync is already running.'
         results = {}
         errors = []
         for name, fn in (('partners', self.sync_partners),
@@ -511,7 +521,7 @@ class SoftlifeSyncClient(models.TransientModel):
             f"{count('machines')} machine(s); "
             f"mirrored {count('odoo_products')} Odoo SKU(s), "
             f"{count('odoo_lots')} lot(s), "
-            f"{count('odoo_lot_stock')} warehouse lot balance(s), "
+            f"{count('odoo_lot_stock')} warehouse-product balance(s), "
             f"{count('odoo_warehouses')} warehouse(s) to Supabase."
         )
         if errors:
@@ -523,6 +533,79 @@ class SoftlifeSyncClient(models.TransientModel):
         icp.set_param('softlife.sync.last_sync', fields.Datetime.now())
         icp.set_param('softlife.sync.last_sync_summary', msg)
         return msg
+
+    @api.model
+    def process_platform_sync_request(self):
+        pending_result = self._retry_pending_platform_sync_result()
+        if pending_result:
+            return pending_result
+        if not self._acquire_sync_lock():
+            return False
+        claimed = self._api_request('GET', '/api/internal/odoo/sync-requests')
+        request = claimed.get('request')
+        if not request:
+            return False
+        request_id = str(request.get('id') or '')
+        claim_token = str(request.get('claim_token') or '')
+        if not request_id or not claim_token:
+            raise SoftlifeAPIError(_('Platform sync request omitted its ID or lease.'), code='invalid_response')
+        try:
+            summary = self.sync_all()
+            accepted = not summary.startswith('Skipped:') and ' Errors:' not in summary
+            result = {
+                'accepted': accepted, 'summary': summary, 'claim_token': claim_token,
+                'error': None if accepted else summary,
+                'finished_at': fields.Datetime.now().isoformat() + 'Z',
+            }
+        except Exception as exc:
+            self.env.cr.rollback()
+            _logger.exception('SoftLife platform-requested sync %s failed', request_id)
+            result = {
+                'accepted': False, 'summary': 'Full Odoo sync raised an exception.', 'claim_token': claim_token,
+                'error': str(exc), 'finished_at': fields.Datetime.now().isoformat() + 'Z',
+            }
+        self.env.cr.commit()
+        pending = {'request_id': request_id, 'result': result}
+        self.env['ir.config_parameter'].sudo().set_param(
+            self._pending_sync_result_key, json.dumps(pending),
+        )
+        self.env.cr.commit()
+        return self._retry_pending_platform_sync_result()
+
+    @api.model
+    def _retry_pending_platform_sync_result(self):
+        icp = self.env['ir.config_parameter'].sudo()
+        raw = icp.get_param(self._pending_sync_result_key)
+        if not raw:
+            return False
+        try:
+            pending = json.loads(raw)
+            request_id = str(pending['request_id'])
+            result = pending['result']
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SoftlifeAPIError(_('Stored platform sync result is invalid.'), code='invalid_response') from exc
+        try:
+            self._api_request(
+                'POST', f'/api/internal/odoo/sync-requests/{request_id}/result', payload=result,
+            )
+        except SoftlifeAPIError as exc:
+            if exc.status != 409:
+                raise
+            icp.set_param(self._pending_sync_result_key, '')
+            self.env.cr.commit()
+            return False
+        icp.set_param(self._pending_sync_result_key, '')
+        self.env.cr.commit()
+        return result
+
+    @api.model
+    def _cron_sync_requests(self):
+        if not self._api_is_configured():
+            return
+        try:
+            self.process_platform_sync_request()
+        except Exception as exc:
+            _logger.warning('SoftLife sync request polling failed: %s', exc)
 
     @api.model
     def _cron_sync(self):
