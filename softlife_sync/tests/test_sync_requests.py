@@ -40,3 +40,41 @@ class TestSyncRequests(TransactionCase):
 
         self.assertFalse(result['accepted'])
         self.assertEqual(result['error'], summary)
+
+    def test_reports_nonfatal_sync_warnings_as_success(self):
+        Client = type(self.client)
+        summary = 'Synced 3 product(s). Warnings: machines: ingredient has no linked Odoo product'
+        with patch.object(Client, '_api_request', side_effect=[
+            {'request': {'id': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3', 'claim_token': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264'}},
+            {'request': {'status': 'completed'}},
+        ]), patch.object(Client, 'sync_all', return_value=summary), \
+                patch.object(Client, '_acquire_sync_lock', return_value=True), \
+                patch.object(type(self.client.env.cr), 'commit'):
+            result = self.client.process_platform_sync_request()
+
+        self.assertTrue(result['accepted'])
+        self.assertIsNone(result['error'])
+        self.assertEqual(result['summary'], summary)
+
+    def test_full_sync_labels_mapping_issues_as_warnings(self):
+        Client = type(self.client)
+        methods = (
+            'sync_partners', 'sync_products', 'sync_odoo_warehouses',
+            'sync_odoo_products', 'sync_odoo_lots', 'sync_odoo_lot_stock',
+        )
+        patches = [patch.object(Client, name, return_value=0) for name in methods]
+        with patch.object(Client, '_is_configured', return_value=True), \
+                patch.object(Client, '_acquire_sync_lock', return_value=True), \
+                patch.object(Client, 'sync_machines', return_value=(1, [
+                    '123 ingredients: solid_1 has no linked Odoo product',
+                ])):
+            for mocked in patches:
+                mocked.start()
+            try:
+                summary = self.client.sync_all()
+            finally:
+                for mocked in reversed(patches):
+                    mocked.stop()
+
+        self.assertIn('Warnings: machines: 123 ingredients:', summary)
+        self.assertNotIn(' Errors:', summary)

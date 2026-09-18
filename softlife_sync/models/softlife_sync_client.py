@@ -494,6 +494,7 @@ class SoftlifeSyncClient(models.TransientModel):
             return 'Skipped: another SoftLife full sync is already running.'
         results = {}
         errors = []
+        warnings = []
         for name, fn in (('partners', self.sync_partners),
                          ('products', self.sync_products),
                          ('machines', self.sync_machines),
@@ -506,7 +507,7 @@ class SoftlifeSyncClient(models.TransientModel):
                     result = fn()
                     if isinstance(result, tuple):
                         results[name] = result[0]
-                        errors.extend(f'{name}: {warning}' for warning in result[1])
+                        warnings.extend(f'{name}: {warning}' for warning in result[1])
                     else:
                         results[name] = result
             except Exception as e:
@@ -530,6 +531,11 @@ class SoftlifeSyncClient(models.TransientModel):
             if len(errors) > len(shown):
                 shown.append(f'{len(errors) - len(shown)} more error(s); see Odoo logs')
             msg += f" Errors: {'; '.join(shown)}"
+        if warnings:
+            shown = warnings[:10]
+            if len(warnings) > len(shown):
+                shown.append(f'{len(warnings) - len(shown)} more warning(s); see Odoo logs')
+            msg += f" Warnings: {'; '.join(shown)}"
         icp = self.env['ir.config_parameter'].sudo()
         icp.set_param('softlife.sync.last_sync', fields.Datetime.now())
         icp.set_param('softlife.sync.last_sync_summary', msg)
