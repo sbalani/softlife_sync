@@ -286,6 +286,7 @@ class SoftlifeSyncClient(models.TransientModel):
         product_quantities = {}
         for quant in self.env['stock.quant'].search([
             ('location_id.usage', '=', 'internal'),
+            ('product_id.active', '=', True),
         ]):
             warehouse = quant.location_id.warehouse_id
             if not warehouse:

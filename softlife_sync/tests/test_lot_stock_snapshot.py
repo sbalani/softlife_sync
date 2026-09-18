@@ -44,6 +44,7 @@ class TestLotStockSnapshot(TransactionCase):
         self.assertEqual(count, 2)
         search.assert_called_once_with([
             ('location_id.usage', '=', 'internal'),
+            ('product_id.active', '=', True),
         ])
         request.assert_called_once_with(
             'POST',
