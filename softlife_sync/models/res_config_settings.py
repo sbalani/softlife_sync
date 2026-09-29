@@ -1,4 +1,5 @@
-from odoo import api, fields, models
+from odoo import _, api, fields, models
+from odoo.exceptions import UserError
 
 
 class ResConfigSettings(models.TransientModel):
@@ -32,6 +33,11 @@ class ResConfigSettings(models.TransientModel):
         default=False,
         help='Allow the read-only hourly Odoo fiscal configuration report to the platform.',
     )
+    softlife_fiscal_company_id = fields.Many2one(
+        'res.company', string='Fiscal issuing company',
+        config_parameter='softlife.sync.fiscal_company_id',
+        help='Legal entity whose company, journal, customer, taxes, and products are checked.',
+    )
     softlife_last_sync = fields.Char(string='Last sync', compute='_compute_softlife_last_sync')
     softlife_last_sync_summary = fields.Char(string='Last result', compute='_compute_softlife_last_sync')
 
@@ -45,6 +51,8 @@ class ResConfigSettings(models.TransientModel):
             rec.softlife_last_sync_summary = summary or ''
 
     def set_values(self):
+        if self.softlife_fiscal_reporting_enabled and not self.softlife_fiscal_company_id:
+            raise UserError(_('Select the Fiscal issuing company before enabling fiscal reporting.'))
         result = super().set_values()
         cron = self.env.ref('softlife_sync.cron_softlife_fiscal_configuration', raise_if_not_found=False)
         if cron:

@@ -30,6 +30,10 @@
                                      help="Off by default. When enabled, sends one read-only configuration report per hour. It cannot create or post invoices.">
                                 <field name="softlife_fiscal_reporting_enabled"/>
                             </setting>
+                            <setting id="softlife_fiscal_company" string="Fiscal issuing company"
+                                     help="Choose the legal entity that owns VEND and will issue the vending invoices.">
+                                <field name="softlife_fiscal_company_id" options="{'no_create': True}"/>
+                            </setting>
                             <setting id="softlife_last" string="Last sync">
                                 <field name="softlife_last_sync" readonly="1"/>
                                 <field name="softlife_last_sync_summary" readonly="1"/>

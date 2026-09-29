@@ -34,10 +34,10 @@ class TestFiscalConfiguration(TransactionCase):
         build.assert_called_once_with(contract)
 
     def test_builds_report_from_effective_odoo_configuration(self):
-        companies = self.env['res.company'].sudo().search([])
-        if len(companies) != 1:
-            self.skipTest('Fiscal reporter deliberately requires a single active company.')
-        company = companies.ensure_one()
+        company = self.env.company
+        self.env['ir.config_parameter'].sudo().set_param(
+            'softlife.sync.fiscal_company_id', str(company.id),
+        )
         country = company.account_fiscal_country_id
         if not country:
             self.skipTest('Test company has no accounting fiscal country.')
@@ -100,6 +100,19 @@ class TestFiscalConfiguration(TransactionCase):
             'country_code': country.code, 'price_include': True,
             'amount_type': 'percent', 'type_tax_use': 'sale',
         }])
+
+    def test_requires_an_explicit_fiscal_company(self):
+        contract = {
+            'contract_version': 1,
+            'expected': {
+                'journal_code': 'VEND', 'customer_odoo_id': 722,
+                'vat_rate': 10, 'currency': 'EUR', 'income_account_code': '701000',
+            },
+        }
+        Client = type(self.client)
+        with patch.object(Client, '_param', return_value=False):
+            with self.assertRaisesRegex(SoftlifeAPIError, 'Select the Fiscal issuing company'):
+                self.client._fiscal_configuration_payload(contract)
 
     def test_rejects_unsupported_contract_before_posting(self):
         Client = type(self.client)

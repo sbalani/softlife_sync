@@ -61,6 +61,7 @@ but manufacturing-period sales orders are now the only automatic revenue sync.
 - **Platform App URL** — application origin hosting `/api/internal/odoo/*`; this is not the Supabase URL
 - **Odoo Sync Secret** — shared `ODOO_SYNC_SECRET`, sent only as `x-odoo-sync-secret`
 - **Fiscal configuration reporting** — disabled by default; explicitly enable it to allow the read-only hourly report
+- **Fiscal issuing company** — required in multi-company databases; choose the legal entity that owns `VEND`
 
 Use **SoftLife → Create Manufacturing Period** for an inclusive date range and
 timezone. Review the preview and blocked details, confirm Odoo-initiated drafts,

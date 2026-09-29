@@ -110,13 +110,19 @@ class SoftlifeSyncClient(models.TransientModel):
         if any(expected.get(field) in (None, '') for field in required):
             raise SoftlifeAPIError(_('Platform fiscal contract omitted required settings.'), code='invalid_response')
 
-        companies = self.env['res.company'].sudo().search([])
-        if len(companies) != 1:
+        raw_company_id = self._param('softlife.sync.fiscal_company_id')
+        try:
+            company_id = int(raw_company_id)
+        except (TypeError, ValueError) as exc:
             raise SoftlifeAPIError(_(
-                'Fiscal reporting requires exactly one active Odoo company; found %s.'
-            ) % len(companies), code='invalid_company_configuration')
-        company = companies.ensure_one()
-        self = self.with_company(company)
+                'Select the Fiscal issuing company in SoftLife Sync settings.'
+            ), code='fiscal_company_not_configured') from exc
+        company = self.env['res.company'].sudo().browse(company_id).exists()
+        if not company or not company.active:
+            raise SoftlifeAPIError(_(
+                'The configured Fiscal issuing company is missing or inactive.'
+            ), code='fiscal_company_not_configured')
+        self = self.sudo().with_company(company)
         fiscal_country = company.account_fiscal_country_id
         journal = self.env['account.journal'].with_company(company).with_context(active_test=False).search([
             ('company_id', '=', company.id),
