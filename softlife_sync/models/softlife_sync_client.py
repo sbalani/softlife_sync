@@ -102,6 +102,120 @@ class SoftlifeSyncClient(models.TransientModel):
                 raise SoftlifeAPIError(_('Catalog pagination omitted next_cursor.'), code='invalid_response')
 
     @api.model
+    def _fiscal_configuration_payload(self, contract):
+        if contract.get('contract_version') != 1 or not isinstance(contract.get('expected'), dict):
+            raise SoftlifeAPIError(_('Platform returned an unsupported fiscal contract.'), code='invalid_response')
+        expected = contract['expected']
+        required = ('journal_code', 'customer_odoo_id', 'vat_rate', 'currency', 'income_account_code')
+        if any(expected.get(field) in (None, '') for field in required):
+            raise SoftlifeAPIError(_('Platform fiscal contract omitted required settings.'), code='invalid_response')
+
+        companies = self.env['res.company'].sudo().search([])
+        if len(companies) != 1:
+            raise SoftlifeAPIError(_(
+                'Fiscal reporting requires exactly one active Odoo company; found %s.'
+            ) % len(companies), code='invalid_company_configuration')
+        company = companies.ensure_one()
+        self = self.with_company(company)
+        fiscal_country = company.account_fiscal_country_id
+        journal = self.env['account.journal'].with_company(company).with_context(active_test=False).search([
+            ('company_id', '=', company.id),
+            ('code', '=', str(expected['journal_code'])),
+        ], limit=1)
+        customer_id = expected['customer_odoo_id']
+        if not isinstance(customer_id, int) or isinstance(customer_id, bool) or customer_id <= 0:
+            raise SoftlifeAPIError(_('Platform fiscal customer ID is invalid.'), code='invalid_response')
+        customer = self.env['res.partner'].browse(customer_id).exists().with_company(company)
+        try:
+            expected_rate = float(expected['vat_rate'])
+        except (TypeError, ValueError) as exc:
+            raise SoftlifeAPIError(_('Platform fiscal VAT rate is invalid.'), code='invalid_response') from exc
+        if not math.isfinite(expected_rate) or expected_rate <= 0:
+            raise SoftlifeAPIError(_('Platform fiscal VAT rate is invalid.'), code='invalid_response')
+        tax = self.env['account.tax'].with_company(company).search([
+            ('company_id', '=', company.id),
+            ('type_tax_use', '=', 'sale'),
+            ('amount_type', '=', 'percent'),
+            ('amount', '=', expected_rate),
+            ('country_id', '=', fiscal_country.id),
+        ], order='id', limit=1)
+
+        products = self.env['product.product'].with_company(company).search([
+            ('active', '=', True),
+            ('softlife_recipe_id', '!=', False),
+        ], order='id')
+        fiscal_position = customer and self.env['account.fiscal.position'].with_company(company)._get_fiscal_position(customer)
+        product_rows = []
+        for product in products:
+            product = product.with_company(company)
+            income = product.product_tmpl_id.with_company(company).get_product_accounts(
+                fiscal_pos=fiscal_position,
+            ).get('income')
+            taxes = product.taxes_id._filter_taxes_by_company(company)
+            if fiscal_position:
+                taxes = fiscal_position.map_tax(taxes)
+            rates = sorted(set(
+                tax_row.amount for tax_row in taxes
+                if tax_row.type_tax_use == 'sale' and tax_row.amount_type == 'percent'
+            ))
+            product_rows.append({
+                'odoo_product_id': product.id,
+                'sale_ok': bool(product.sale_ok),
+                'income_account_code': income.code if income else None,
+                'sale_tax_rates': rates,
+                'sale_tax_country_codes': sorted(set(
+                    tax_row.country_id.code for tax_row in taxes if tax_row.country_id.code
+                )),
+                'sale_tax_ids': sorted(taxes.ids),
+                'sale_taxes': [{
+                    'odoo_tax_id': tax_row.id,
+                    'rate': tax_row.amount,
+                    'country_code': tax_row.country_id.code if tax_row.country_id else None,
+                    'price_include': bool(tax_row.price_include),
+                    'amount_type': tax_row.amount_type,
+                    'type_tax_use': tax_row.type_tax_use,
+                } for tax_row in taxes.sorted('id')],
+            })
+
+        return {
+            'contract_version': 1,
+            'checked_at': fields.Datetime.now().isoformat() + 'Z',
+            'company': {
+                'country_code': fiscal_country.code if fiscal_country else None,
+                'vat': company.vat or None,
+                'currency': company.currency_id.name or None,
+            },
+            'journal': {
+                'code': journal.code if journal else None,
+                'type': journal.type if journal else None,
+                'refund_sequence': bool(journal and journal.refund_sequence),
+                'secure_posted_entries': bool(journal and journal.restrict_mode_hash_table),
+            },
+            'customer': {
+                'odoo_id': customer.id if customer else None,
+                'country_code': customer.country_id.code if customer and customer.country_id else None,
+                'vat': (customer.vat or None) if customer else None,
+            },
+            'tax': {
+                'odoo_id': tax.id if tax else None,
+                'type_tax_use': tax.type_tax_use if tax else None,
+                'rate': tax.amount if tax else None,
+                'country_code': tax.country_id.code if tax and tax.country_id else None,
+                'price_include': bool(tax and tax.price_include),
+                'amount_type': tax.amount_type if tax else None,
+            },
+            'products': product_rows,
+        }
+
+    @api.model
+    def report_fiscal_configuration(self):
+        contract = self._api_request('GET', '/api/internal/odoo/fiscal-configuration')
+        payload = self._fiscal_configuration_payload(contract)
+        return self._api_request(
+            'POST', '/api/internal/odoo/fiscal-configuration', payload=payload,
+        )
+
+    @api.model
     def _rest_get(self, table, params=None):
         import requests
         base = self._param('softlife.sync.supabase_url').rstrip('/')
@@ -613,6 +727,16 @@ class SoftlifeSyncClient(models.TransientModel):
             self.process_platform_sync_request()
         except Exception as exc:
             _logger.warning('SoftLife sync request polling failed: %s', exc)
+
+    @api.model
+    def _cron_fiscal_configuration(self):
+        if not self._api_is_configured():
+            return
+        try:
+            self.report_fiscal_configuration()
+        except Exception as exc:
+            _logger.exception('SoftLife fiscal configuration report failed: %s', exc)
+            raise
 
     @api.model
     def _cron_sync(self):

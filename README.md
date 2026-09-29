@@ -72,6 +72,11 @@ per recipe version, one MO per export/warehouse/version/currency, and one sales
 order per export/warehouse. Sales orders are confirmed and deliveries validated;
 this module never creates an invoice from a manufacturing period.
 
+An hourly fiscal-configuration report verifies the issuing company, `VEND`
+sales journal, final-consumer customer, 10% sales tax, effective finished-product
+income accounts, and customer taxes against the platform's read-only invoicing
+preflight contract. This report does not create or post invoices.
+
 ### Package content and recipe dosage
 
 Ingredient inventory remains in its existing Odoo UoM (normally **Units**).
