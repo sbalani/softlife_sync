@@ -209,11 +209,17 @@ class SoftlifeSyncClient(models.TransientModel):
 
     @api.model
     def report_fiscal_configuration(self):
+        if not self._fiscal_configuration_reporting_enabled():
+            return {'accepted': False, 'disabled': True}
         contract = self._api_request('GET', '/api/internal/odoo/fiscal-configuration')
         payload = self._fiscal_configuration_payload(contract)
         return self._api_request(
             'POST', '/api/internal/odoo/fiscal-configuration', payload=payload,
         )
+
+    @api.model
+    def _fiscal_configuration_reporting_enabled(self):
+        return str(self._param('softlife.sync.fiscal_reporting_enabled', 'False')).lower() in ('1', 'true')
 
     @api.model
     def _rest_get(self, table, params=None):
@@ -730,7 +736,7 @@ class SoftlifeSyncClient(models.TransientModel):
 
     @api.model
     def _cron_fiscal_configuration(self):
-        if not self._api_is_configured():
+        if not self._fiscal_configuration_reporting_enabled() or not self._api_is_configured():
             return
         try:
             self.report_fiscal_configuration()

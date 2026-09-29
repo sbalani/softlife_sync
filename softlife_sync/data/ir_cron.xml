@@ -26,7 +26,7 @@
             <field name="code">model._cron_fiscal_configuration()</field>
             <field name="interval_number">1</field>
             <field name="interval_type">hours</field>
-            <field name="active" eval="True"/>
+            <field name="active" eval="False"/>
         </record>
         <record id="cron_softlife_manufacturing" model="ir.cron">
             <field name="name">SoftLife: manufacturing sync</field>

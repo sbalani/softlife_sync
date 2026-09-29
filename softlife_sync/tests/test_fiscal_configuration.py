@@ -22,7 +22,8 @@ class TestFiscalConfiguration(TransactionCase):
         }
         payload = {'contract_version': 1, 'checked_at': '2026-09-29T15:00:00Z'}
         Client = type(self.client)
-        with patch.object(Client, '_api_request', side_effect=[contract, {'accepted': True}]) as api, \
+        with patch.object(Client, '_fiscal_configuration_reporting_enabled', return_value=True), \
+                patch.object(Client, '_api_request', side_effect=[contract, {'accepted': True}]) as api, \
                 patch.object(Client, '_fiscal_configuration_payload', return_value=payload) as build:
             result = self.client.report_fiscal_configuration()
 
@@ -102,21 +103,32 @@ class TestFiscalConfiguration(TransactionCase):
 
     def test_rejects_unsupported_contract_before_posting(self):
         Client = type(self.client)
-        with patch.object(Client, '_api_request', return_value={'contract_version': 2, 'expected': {}}) as api:
+        with patch.object(Client, '_fiscal_configuration_reporting_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value={'contract_version': 2, 'expected': {}}) as api:
             with self.assertRaisesRegex(SoftlifeAPIError, 'unsupported fiscal contract'):
                 self.client.report_fiscal_configuration()
         self.assertEqual(api.call_count, 1)
 
-    def test_cron_skips_when_platform_api_is_not_configured(self):
+    def test_direct_report_does_not_call_platform_when_disabled(self):
         Client = type(self.client)
-        with patch.object(Client, '_api_is_configured', return_value=False), \
+        with patch.object(Client, '_fiscal_configuration_reporting_enabled', return_value=False), \
+                patch.object(Client, '_api_request') as api:
+            result = self.client.report_fiscal_configuration()
+        self.assertEqual(result, {'accepted': False, 'disabled': True})
+        api.assert_not_called()
+
+    def test_cron_skips_when_fiscal_reporting_is_disabled(self):
+        Client = type(self.client)
+        with patch.object(Client, '_fiscal_configuration_reporting_enabled', return_value=False), \
+                patch.object(Client, '_api_is_configured', return_value=True), \
                 patch.object(Client, 'report_fiscal_configuration') as report:
             self.client._cron_fiscal_configuration()
         report.assert_not_called()
 
     def test_cron_exposes_reporting_failures(self):
         Client = type(self.client)
-        with patch.object(Client, '_api_is_configured', return_value=True), \
+        with patch.object(Client, '_fiscal_configuration_reporting_enabled', return_value=True), \
+                patch.object(Client, '_api_is_configured', return_value=True), \
                 patch.object(Client, 'report_fiscal_configuration', side_effect=RuntimeError('report failed')):
             with self.assertRaisesRegex(RuntimeError, 'report failed'):
                 self.client._cron_fiscal_configuration()

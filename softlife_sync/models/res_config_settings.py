@@ -26,6 +26,12 @@ class ResConfigSettings(models.TransientModel):
         config_parameter='softlife.sync.default_product_id',
         help='Product used on the invoice line (provides the revenue account).',
     )
+    softlife_fiscal_reporting_enabled = fields.Boolean(
+        string='Fiscal configuration reporting',
+        config_parameter='softlife.sync.fiscal_reporting_enabled',
+        default=False,
+        help='Allow the read-only hourly Odoo fiscal configuration report to the platform.',
+    )
     softlife_last_sync = fields.Char(string='Last sync', compute='_compute_softlife_last_sync')
     softlife_last_sync_summary = fields.Char(string='Last result', compute='_compute_softlife_last_sync')
 
@@ -37,6 +43,13 @@ class ResConfigSettings(models.TransientModel):
         for rec in self:
             rec.softlife_last_sync = last or ''
             rec.softlife_last_sync_summary = summary or ''
+
+    def set_values(self):
+        result = super().set_values()
+        cron = self.env.ref('softlife_sync.cron_softlife_fiscal_configuration', raise_if_not_found=False)
+        if cron:
+            cron.active = bool(self.softlife_fiscal_reporting_enabled)
+        return result
 
     def action_sync_now(self):
         msg = self.env['softlife.sync.client'].sudo().sync_all()

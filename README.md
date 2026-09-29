@@ -60,6 +60,7 @@ but manufacturing-period sales orders are now the only automatic revenue sync.
 - **Service Role Key** — bypasses RLS for server-to-server reads (kept in Odoo config, like the old Huaxin keys)
 - **Platform App URL** — application origin hosting `/api/internal/odoo/*`; this is not the Supabase URL
 - **Odoo Sync Secret** — shared `ODOO_SYNC_SECRET`, sent only as `x-odoo-sync-secret`
+- **Fiscal configuration reporting** — disabled by default; explicitly enable it to allow the read-only hourly report
 
 Use **SoftLife → Create Manufacturing Period** for an inclusive date range and
 timezone. Review the preview and blocked details, confirm Odoo-initiated drafts,
@@ -72,7 +73,7 @@ per recipe version, one MO per export/warehouse/version/currency, and one sales
 order per export/warehouse. Sales orders are confirmed and deliveries validated;
 this module never creates an invoice from a manufacturing period.
 
-An hourly fiscal-configuration report verifies the issuing company, `VEND`
+When explicitly enabled, an hourly fiscal-configuration report verifies the issuing company, `VEND`
 sales journal, final-consumer customer, 10% sales tax, effective finished-product
 income accounts, and customer taxes against the platform's read-only invoicing
 preflight contract. This report does not create or post invoices.

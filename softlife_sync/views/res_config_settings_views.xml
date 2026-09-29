@@ -26,6 +26,10 @@
                                      help="Accounting customer used on Sales Orders created by manufacturing runs.">
                                 <field name="softlife_default_partner_id"/>
                             </setting>
+                            <setting id="softlife_fiscal_reporting" string="Fiscal configuration reporting"
+                                     help="Off by default. When enabled, sends one read-only configuration report per hour. It cannot create or post invoices.">
+                                <field name="softlife_fiscal_reporting_enabled"/>
+                            </setting>
                             <setting id="softlife_last" string="Last sync">
                                 <field name="softlife_last_sync" readonly="1"/>
                                 <field name="softlife_last_sync_summary" readonly="1"/>
