@@ -40,6 +40,18 @@ class ResConfigSettings(models.TransientModel):
         help='Allow narrowly scoped platform requests to repair income accounts and sales taxes on '
              'existing SoftLife products. This is independent from read-only fiscal reporting.',
     )
+    softlife_fiscal_invoice_draft_creation_enabled = fields.Boolean(
+        string='Allow platform-requested fiscal invoice draft creation',
+        config_parameter='softlife.sync.fiscal_invoice_draft_creation_enabled',
+        default=False,
+        help='Allow validated platform requests to create fiscal customer invoice drafts.',
+    )
+    softlife_fiscal_invoice_confirmation_enabled = fields.Boolean(
+        string='Allow platform-requested fiscal invoice confirmation',
+        config_parameter='softlife.sync.fiscal_invoice_confirmation_enabled',
+        default=False,
+        help='Allow validated platform requests to post only their explicitly listed fiscal invoices.',
+    )
     softlife_fiscal_company_id = fields.Many2one(
         'res.company', string='Fiscal issuing company',
         config_parameter='softlife.sync.fiscal_company_id',
@@ -58,10 +70,13 @@ class ResConfigSettings(models.TransientModel):
             rec.softlife_last_sync_summary = summary or ''
 
     def set_values(self):
-        if (self.softlife_fiscal_reporting_enabled or self.softlife_fiscal_product_remediation_enabled) \
+        if (self.softlife_fiscal_reporting_enabled
+                or self.softlife_fiscal_product_remediation_enabled
+                or self.softlife_fiscal_invoice_draft_creation_enabled
+                or self.softlife_fiscal_invoice_confirmation_enabled) \
                 and not self.softlife_fiscal_company_id:
             raise UserError(_(
-                'Select the Fiscal issuing company before enabling fiscal reporting or remediation.'
+                'Select the Fiscal issuing company before enabling a fiscal integration.'
             ))
         result = super().set_values()
         cron = self.env.ref('softlife_sync.cron_softlife_fiscal_configuration', raise_if_not_found=False)

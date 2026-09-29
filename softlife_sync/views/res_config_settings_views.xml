@@ -35,6 +35,16 @@
                                      help="Off by default. Allows validated platform requests to repair only existing SoftLife product income accounts and sales taxes. This is separate from read-only reporting.">
                                 <field name="softlife_fiscal_product_remediation_enabled"/>
                             </setting>
+                            <setting id="softlife_fiscal_invoice_draft_creation"
+                                     string="Allow platform-requested fiscal invoice draft creation"
+                                     help="Off by default. Allows exact, validated batches to create only draft customer invoices.">
+                                <field name="softlife_fiscal_invoice_draft_creation_enabled"/>
+                            </setting>
+                            <setting id="softlife_fiscal_invoice_confirmation"
+                                     string="Allow platform-requested fiscal invoice confirmation"
+                                     help="Off by default. Allows exact, validated batches to post only explicitly listed SoftLife fiscal invoices.">
+                                <field name="softlife_fiscal_invoice_confirmation_enabled"/>
+                            </setting>
                             <setting id="softlife_fiscal_company" string="Fiscal issuing company"
                                      help="Choose the legal entity that owns VEND and will issue the vending invoices.">
                                 <field name="softlife_fiscal_company_id" options="{'no_create': True}"/>

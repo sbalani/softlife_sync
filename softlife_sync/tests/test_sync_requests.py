@@ -14,12 +14,18 @@ class TestSyncRequests(TransactionCase):
 
     def test_processes_platform_request_and_posts_success(self):
         Client = type(self.client)
+        committed_pending = []
         with patch.object(Client, '_api_request', side_effect=[
             {'request': {'id': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264', 'claim_token': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3', 'kind': 'stock_snapshot'}},
             {'request': {'status': 'completed'}},
         ]) as api, patch.object(Client, 'sync_all', return_value='Synced all warehouse stock.'), \
                 patch.object(Client, '_acquire_sync_lock', return_value=True), \
-                patch.object(type(self.client.env.cr), 'commit'):
+                patch.object(type(self.client.env.cr), 'commit') as commit:
+            commit.side_effect = lambda: committed_pending.append(
+                self.env['ir.config_parameter'].sudo().get_param(
+                    self.client._pending_sync_result_key,
+                )
+            )
             result = self.client.process_platform_sync_request()
 
         self.assertTrue(result['accepted'])
@@ -28,6 +34,9 @@ class TestSyncRequests(TransactionCase):
         ))
         self.assertEqual(api.call_args_list[1].kwargs['payload'], result)
         self.assertEqual(result['claim_token'], '7cbd854e-3f88-4ca3-b86b-a4853adffbd3')
+        self.assertEqual(commit.call_count, 2)
+        self.assertTrue(committed_pending[0])
+        self.assertFalse(committed_pending[1])
 
     def test_reports_partial_sync_errors_as_failure(self):
         Client = type(self.client)
@@ -86,6 +95,42 @@ class TestSyncRequests(TransactionCase):
         self.assertFalse(result['accepted'])
         sync_all.assert_not_called()
         remediate.assert_not_called()
+
+    def test_dispatches_fiscal_invoice_kinds_with_frozen_hashes(self):
+        Client = type(self.client)
+        payload = {'contract_version': 1}
+        payload_hash = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(',', ':'),
+        ).encode()).hexdigest()
+        with patch.object(Client, '_create_fiscal_invoice_drafts', return_value={
+                'accepted': True, 'summary': 'drafted'}) as create, \
+                patch.object(Client, '_confirm_fiscal_invoices', return_value={
+                    'accepted': True, 'summary': 'confirmed'}) as confirm:
+            draft_result = self.client._dispatch_platform_sync_request({
+                'kind': 'fiscal_invoice_draft_creation', 'payload': payload,
+                'payload_sha256': payload_hash,
+            })
+            confirmation_result = self.client._dispatch_platform_sync_request({
+                'kind': 'fiscal_invoice_bulk_confirmation', 'payload': payload,
+                'payload_sha256': payload_hash,
+            })
+        self.assertEqual(draft_result['summary'], 'drafted')
+        self.assertEqual(confirmation_result['summary'], 'confirmed')
+        create.assert_called_once_with(payload)
+        confirm.assert_called_once_with(payload)
+        self.assertFalse(hasattr(self.client, 'create_fiscal_invoice_drafts'))
+        self.assertFalse(hasattr(self.client, 'confirm_fiscal_invoices'))
+
+    def test_rejects_fiscal_invoice_hash_mismatch_before_handler(self):
+        Client = type(self.client)
+        with patch.object(Client, '_create_fiscal_invoice_drafts') as create:
+            result = self.client._dispatch_platform_sync_request({
+                'kind': 'fiscal_invoice_draft_creation',
+                'payload': {'contract_version': 1},
+                'payload_sha256': '0' * 64,
+            })
+        self.assertFalse(result['accepted'])
+        create.assert_not_called()
 
     def test_unknown_request_kind_fails_closed(self):
         Client = type(self.client)

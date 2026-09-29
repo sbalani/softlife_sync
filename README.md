@@ -62,6 +62,8 @@ but manufacturing-period sales orders are now the only automatic revenue sync.
 - **Odoo Sync Secret** — shared `ODOO_SYNC_SECRET`, sent only as `x-odoo-sync-secret`
 - **Fiscal configuration reporting** — disabled by default; explicitly enable it to allow the read-only hourly report
 - **Allow platform-requested fiscal product configuration repairs** — a separate, disabled-by-default opt-in for narrowly scoped income-account and sales-tax repairs
+- **Allow platform-requested fiscal invoice draft creation** — an independent, disabled-by-default opt-in for validated fiscal draft batches
+- **Allow platform-requested fiscal invoice confirmation** — an independent, disabled-by-default opt-in for posting explicitly listed fiscal drafts
 - **Fiscal issuing company** — required in multi-company databases; choose the legal entity that owns `VEND`
 
 Use **SoftLife → Create Manufacturing Period** for an inclusive date range and
@@ -87,6 +89,29 @@ connector validates the complete batch before changing anything, rejects unsafe
 partial multi-variant templates, preserves taxes from other companies, verifies
 the effective customer fiscal-position result, and submits a fresh configuration
 report. It never creates products, accounts, taxes, sales, invoices, or postings.
+
+Fiscal invoice processing uses the existing platform request queue and two generic
+kinds: `fiscal_invoice_draft_creation` and `fiscal_invoice_bulk_confirmation`.
+Both require the queue's canonical frozen payload hash and the current platform
+fiscal contract. Draft batches are validated in full before any write, including
+the configured Spanish EUR company, sales journal, final-consumer customer,
+price-inclusion mode, exact tax, effective fiscal-position account/tax mappings,
+product eligibility, line cents, invoice hashes, and recomputed Odoo totals.
+Accepted invoices remain in draft. Their immutable platform UUID and payload hash
+and enriched frozen invoice snapshot are stored on `account.move`; retries reuse
+an exact draft, while a changed, posted, or internally inconsistent draft payload
+is rejected. Tagged drafts cannot be posted manually or have their provenance,
+accounting date, invoice headers, or lines changed outside the connector's
+process-local authorization.
+
+Bulk confirmation resolves every invoice by both platform UUID and Odoo move ID,
+validates the complete batch, and posts only the explicitly listed drafts in one
+savepoint after locking them. Confirmation revalidates each persisted snapshot and
+current Odoo structure immediately before posting and again afterward. The current
+sales journal must use Odoo's secure posted-entry hash table. Exact retries of
+already posted invoices succeed. Unrelated drafts are never included. Creation and
+confirmation remain disabled unless their respective settings are enabled, and
+enabling either requires an explicit fiscal company.
 
 ### Package content and recipe dosage
 
