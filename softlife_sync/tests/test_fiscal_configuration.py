@@ -85,6 +85,13 @@ class TestFiscalConfiguration(TransactionCase):
         })
 
         self.assertEqual(payload['company']['country_code'], country.code)
+        self.assertEqual(payload['company']['odoo_id'], company.id)
+        self.assertEqual(payload['capabilities']['fiscal_product_remediation'], 1)
+        self.assertEqual(payload['income_account'], {
+            'odoo_id': expected_income.id,
+            'code': expected_income.code,
+            'account_type': expected_income.account_type,
+        })
         self.assertEqual(payload['journal']['code'], journal.code)
         self.assertEqual(payload['customer']['odoo_id'], customer.id)
         self.assertEqual(payload['tax']['odoo_id'], tax.id)

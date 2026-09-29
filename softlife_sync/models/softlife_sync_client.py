@@ -2,9 +2,11 @@
 into Odoo. Odoo is the downstream ERP; the middleware is the system of record.
 """
 import datetime
+import hashlib
 import json
 import logging
 import math
+import re
 from urllib.parse import urljoin
 
 from odoo import _, api, fields, models
@@ -110,20 +112,17 @@ class SoftlifeSyncClient(models.TransientModel):
         if any(expected.get(field) in (None, '') for field in required):
             raise SoftlifeAPIError(_('Platform fiscal contract omitted required settings.'), code='invalid_response')
 
-        raw_company_id = self._param('softlife.sync.fiscal_company_id')
-        try:
-            company_id = int(raw_company_id)
-        except (TypeError, ValueError) as exc:
-            raise SoftlifeAPIError(_(
-                'Select the Fiscal issuing company in SoftLife Sync settings.'
-            ), code='fiscal_company_not_configured') from exc
-        company = self.env['res.company'].sudo().browse(company_id).exists()
-        if not company or not company.active:
-            raise SoftlifeAPIError(_(
-                'The configured Fiscal issuing company is missing or inactive.'
-            ), code='fiscal_company_not_configured')
+        company = self._fiscal_company()
         self = self.sudo().with_company(company)
         fiscal_country = company.account_fiscal_country_id
+        income_accounts = self.env['account.account'].with_company(company).search([
+            ('code', '=', str(expected['income_account_code'])),
+            ('account_type', 'in', ('income', 'income_other')),
+        ])
+        income_accounts = income_accounts.filtered(
+            lambda account: self._account_applies_to_company(account, company)
+        )
+        income_account = income_accounts if len(income_accounts) == 1 else self.env['account.account']
         journal = self.env['account.journal'].with_company(company).with_context(active_test=False).search([
             ('company_id', '=', company.id),
             ('code', '=', str(expected['journal_code'])),
@@ -153,13 +152,9 @@ class SoftlifeSyncClient(models.TransientModel):
         fiscal_position = customer and self.env['account.fiscal.position'].with_company(company)._get_fiscal_position(customer)
         product_rows = []
         for product in products:
-            product = product.with_company(company)
-            income = product.product_tmpl_id.with_company(company).get_product_accounts(
-                fiscal_pos=fiscal_position,
-            ).get('income')
-            taxes = product.taxes_id._filter_taxes_by_company(company)
-            if fiscal_position:
-                taxes = fiscal_position.map_tax(taxes)
+            income, taxes = self._effective_product_fiscal_configuration(
+                product, company, fiscal_position,
+            )
             rates = sorted(set(
                 tax_row.amount for tax_row in taxes
                 if tax_row.type_tax_use == 'sale' and tax_row.amount_type == 'percent'
@@ -185,11 +180,18 @@ class SoftlifeSyncClient(models.TransientModel):
 
         return {
             'contract_version': 1,
+            'capabilities': {'fiscal_product_remediation': 1},
             'checked_at': fields.Datetime.now().isoformat() + 'Z',
             'company': {
+                'odoo_id': company.id,
                 'country_code': fiscal_country.code if fiscal_country else None,
                 'vat': company.vat or None,
                 'currency': company.currency_id.name or None,
+            },
+            'income_account': {
+                'odoo_id': income_account.id if income_account else None,
+                'code': income_account.code if income_account else None,
+                'account_type': income_account.account_type if income_account else None,
             },
             'journal': {
                 'code': journal.code if journal else None,
@@ -214,6 +216,41 @@ class SoftlifeSyncClient(models.TransientModel):
         }
 
     @api.model
+    def _fiscal_company(self):
+        raw_company_id = self._param('softlife.sync.fiscal_company_id')
+        try:
+            company_id = int(raw_company_id)
+        except (TypeError, ValueError) as exc:
+            raise SoftlifeAPIError(_(
+                'Select the Fiscal issuing company in SoftLife Sync settings.'
+            ), code='fiscal_company_not_configured') from exc
+        company = self.env['res.company'].sudo().browse(company_id).exists()
+        if not company or not company.active:
+            raise SoftlifeAPIError(_(
+                'The configured Fiscal issuing company is missing or inactive.'
+            ), code='fiscal_company_not_configured')
+        return company
+
+    @api.model
+    def _account_applies_to_company(self, account, company):
+        if 'company_ids' in account._fields:
+            return company in account.company_ids
+        if 'company_id' in account._fields:
+            return account.company_id == company
+        return True
+
+    @api.model
+    def _effective_product_fiscal_configuration(self, product, company, fiscal_position):
+        product = product.with_company(company)
+        income = product.product_tmpl_id.with_company(company).get_product_accounts(
+            fiscal_pos=fiscal_position,
+        ).get('income')
+        taxes = product.taxes_id._filter_taxes_by_company(company)
+        if fiscal_position:
+            taxes = fiscal_position.map_tax(taxes)
+        return income, taxes
+
+    @api.model
     def report_fiscal_configuration(self):
         if not self._fiscal_configuration_reporting_enabled():
             return {'accepted': False, 'disabled': True}
@@ -226,6 +263,221 @@ class SoftlifeSyncClient(models.TransientModel):
     @api.model
     def _fiscal_configuration_reporting_enabled(self):
         return str(self._param('softlife.sync.fiscal_reporting_enabled', 'False')).lower() in ('1', 'true')
+
+    @api.model
+    def _fiscal_product_remediation_enabled(self):
+        return str(self._param(
+            'softlife.sync.fiscal_product_remediation_enabled', 'False',
+        )).lower() in ('1', 'true')
+
+    @api.model
+    def _remediation_error(self, message):
+        raise SoftlifeAPIError(message, code='invalid_fiscal_product_remediation')
+
+    @api.model
+    def _validate_fiscal_product_remediation(self, payload, contract):
+        expected_keys = {
+            'contract_version', 'configuration_report_id', 'configuration_payload_sha256',
+            'company', 'customer', 'target', 'products',
+        }
+        if not isinstance(payload, dict) or set(payload) != expected_keys:
+            self._remediation_error(_('Fiscal product remediation payload fields are invalid.'))
+        if payload['contract_version'] != 1:
+            self._remediation_error(_('Fiscal product remediation contract version is unsupported.'))
+        report_id = payload['configuration_report_id']
+        digest = payload['configuration_payload_sha256']
+        if not isinstance(report_id, str) or not report_id.strip():
+            self._remediation_error(_('Fiscal product remediation report ID is invalid.'))
+        if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            self._remediation_error(_('Fiscal product remediation report hash is invalid.'))
+
+        company_payload = payload['company']
+        customer_payload = payload['customer']
+        target = payload['target']
+        products_payload = payload['products']
+        if not isinstance(company_payload, dict) or set(company_payload) != {
+                'odoo_id', 'country_code', 'currency'}:
+            self._remediation_error(_('Fiscal product remediation company fields are invalid.'))
+        if not isinstance(customer_payload, dict) or set(customer_payload) != {'odoo_id'}:
+            self._remediation_error(_('Fiscal product remediation customer fields are invalid.'))
+        if not isinstance(target, dict) or set(target) != {'income_account', 'sale_tax'}:
+            self._remediation_error(_('Fiscal product remediation target fields are invalid.'))
+        account_payload = target['income_account']
+        tax_payload = target['sale_tax']
+        if not isinstance(account_payload, dict) or set(account_payload) != {
+                'odoo_id', 'code', 'account_type'}:
+            self._remediation_error(_('Fiscal product remediation income account fields are invalid.'))
+        if not isinstance(tax_payload, dict) or set(tax_payload) != {
+                'odoo_tax_id', 'rate', 'country_code', 'type_tax_use', 'amount_type',
+                'price_include'}:
+            self._remediation_error(_('Fiscal product remediation sales tax fields are invalid.'))
+        if not isinstance(products_payload, list) or not 1 <= len(products_payload) <= 500:
+            self._remediation_error(_('Fiscal product remediation requires 1 to 500 products.'))
+
+        product_rows = {}
+        for row in products_payload:
+            if not isinstance(row, dict) or set(row) != {
+                    'odoo_product_id', 'remediate_income_account', 'remediate_customer_taxes'}:
+                self._remediation_error(_('Fiscal product remediation product fields are invalid.'))
+            product_id = row['odoo_product_id']
+            account_flag = row['remediate_income_account']
+            tax_flag = row['remediate_customer_taxes']
+            if (
+                not self._positive_int(product_id)
+                or not isinstance(account_flag, bool) or not isinstance(tax_flag, bool)
+                or not (account_flag or tax_flag) or product_id in product_rows
+            ):
+                self._remediation_error(_('Fiscal product remediation product entry is invalid.'))
+            product_rows[product_id] = row
+
+        company = self._fiscal_company()
+        fiscal_country = company.account_fiscal_country_id
+        if (
+            not self._positive_int(company_payload['odoo_id'])
+            or company_payload['odoo_id'] != company.id
+            or company_payload['country_code'] != (fiscal_country.code if fiscal_country else None)
+            or company_payload['country_code'] != 'ES'
+            or company_payload['currency'] != company.currency_id.name
+        ):
+            self._remediation_error(_('Fiscal product remediation company does not match Odoo.'))
+        expected = contract.get('expected') if isinstance(contract, dict) else None
+        if not isinstance(contract, dict) or contract.get('contract_version') != 1 or not isinstance(expected, dict):
+            self._remediation_error(_('Current platform fiscal contract is invalid.'))
+        if expected.get('currency') != company.currency_id.name:
+            self._remediation_error(_('Current platform fiscal currency does not match Odoo.'))
+        customer_id = customer_payload['odoo_id']
+        if (
+            not self._positive_int(customer_id)
+            or customer_id != expected.get('customer_odoo_id')
+            or not self.env['res.partner'].sudo().browse(customer_id).exists()
+        ):
+            self._remediation_error(_('Fiscal product remediation customer is not the fiscal customer.'))
+
+        account_id = account_payload['odoo_id']
+        if not self._positive_int(account_id) or account_payload['account_type'] not in ('income', 'income_other'):
+            self._remediation_error(_('Fiscal product remediation income account is invalid.'))
+        account = self.env['account.account'].sudo().with_company(company).browse(account_id).exists()
+        if (
+            not account
+            or account.code != account_payload['code']
+            or account.account_type != account_payload['account_type']
+            or account.code != str(expected.get('income_account_code'))
+            or not self._account_applies_to_company(account, company)
+        ):
+            self._remediation_error(_('Fiscal product remediation income account does not match Odoo.'))
+
+        tax_id = tax_payload['odoo_tax_id']
+        rate = tax_payload['rate']
+        if not self._positive_int(tax_id) or not self._number(rate) or rate <= 0:
+            self._remediation_error(_('Fiscal product remediation sales tax is invalid.'))
+        tax = self.env['account.tax'].sudo().with_context(active_test=False).browse(tax_id).exists()
+        try:
+            expected_rate = float(expected.get('vat_rate'))
+        except (TypeError, ValueError):
+            self._remediation_error(_('Current platform fiscal VAT rate is invalid.'))
+        if (
+            not tax or not tax.active or tax.company_id != company
+            or tax.type_tax_use != 'sale' or tax_payload['type_tax_use'] != 'sale'
+            or tax.amount_type != 'percent' or tax_payload['amount_type'] != 'percent'
+            or tax.amount != rate or expected_rate != rate
+            or not tax.country_id or tax.country_id.code != 'ES'
+            or tax.country_id != fiscal_country
+            or tax_payload['country_code'] != 'ES'
+            or not isinstance(tax_payload['price_include'], bool)
+            or bool(tax.price_include) != tax_payload['price_include']
+        ):
+            self._remediation_error(_('Fiscal product remediation sales tax does not match Odoo.'))
+
+        products = self.env['product.product'].sudo().with_context(active_test=False).browse(
+            list(product_rows)
+        ).exists()
+        if len(products) != len(product_rows) or any(
+                not product.active or not product.softlife_recipe_id for product in products):
+            self._remediation_error(_('Fiscal product remediation contains an inactive or non-SoftLife product.'))
+        supplied_ids = set(product_rows)
+        for template in products.product_tmpl_id:
+            variant_ids = set(template.with_context(active_test=False).product_variant_ids.ids)
+            if len(variant_ids) > 1 and not variant_ids.issubset(supplied_ids):
+                self._remediation_error(_(
+                    'Fiscal product remediation must include every variant of a product template.'
+                ))
+            variant_rows = [product_rows[variant_id] for variant_id in variant_ids]
+            if len(variant_ids) > 1 and (
+                len({row['remediate_income_account'] for row in variant_rows}) != 1
+                or len({row['remediate_customer_taxes'] for row in variant_rows}) != 1
+            ):
+                self._remediation_error(_(
+                    'Fiscal product remediation flags must match for every variant of a template.'
+                ))
+        return company, self.env['res.partner'].sudo().browse(customer_id), account, tax, products, product_rows
+
+    @staticmethod
+    def _positive_int(value):
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    @staticmethod
+    def _number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+    @api.model
+    def remediate_fiscal_products(self, payload):
+        if not self._fiscal_product_remediation_enabled():
+            raise SoftlifeAPIError(
+                _('Fiscal product remediation is disabled in Odoo Settings.'),
+                code='fiscal_product_remediation_disabled',
+            )
+        contract = self._api_request('GET', '/api/internal/odoo/fiscal-configuration')
+        company, customer, account, tax, products, rows = \
+            self._validate_fiscal_product_remediation(payload, contract)
+        fiscal_position = self.env['account.fiscal.position'].sudo().with_company(
+            company,
+        )._get_fiscal_position(customer.with_company(company))
+        all_company_ids = self.env['res.company'].sudo().search([]).ids
+        with self.env.cr.savepoint():
+            for template in products.product_tmpl_id:
+                template_products = products.filtered(lambda product: product.product_tmpl_id == template)
+                if any(rows[product.id]['remediate_income_account'] for product in template_products):
+                    template.sudo().with_company(company).property_account_income_id = account
+                if any(rows[product.id]['remediate_customer_taxes'] for product in template_products):
+                    template_all_companies = template.sudo().with_context(
+                        active_test=False, allowed_company_ids=all_company_ids,
+                    )
+                    other_tax_ids = template_all_companies.taxes_id.filtered(
+                        lambda current_tax: current_tax.company_id != company
+                    ).ids
+                    template_all_companies.with_company(company).taxes_id = [(6, 0, other_tax_ids + tax.ids)]
+            for product in products:
+                effective_account, effective_taxes = self._effective_product_fiscal_configuration(
+                    product.sudo(), company, fiscal_position,
+                )
+                row = rows[product.id]
+                if row['remediate_income_account'] and effective_account != account:
+                    self._remediation_error(_(
+                        'Fiscal product remediation income account verification failed.'
+                    ))
+                if row['remediate_customer_taxes'] and effective_taxes != tax:
+                    self._remediation_error(_(
+                        'Fiscal product remediation sales tax verification failed.'
+                    ))
+            verification_payload = self._fiscal_configuration_payload(contract)
+            verification = self._api_request(
+                'POST', '/api/internal/odoo/fiscal-configuration', payload=verification_payload,
+            )
+        result = {
+            'accepted': True,
+            'summary': _('Remediated and verified %s fiscal product configuration(s).') % len(products),
+        }
+        report_id = (
+            verification.get('configuration_report_id')
+            or verification.get('report_id')
+            or verification.get('id')
+        )
+        report_hash = verification.get('configuration_payload_sha256') or verification.get('payload_sha256')
+        if report_id:
+            result['verification_report_id'] = report_id
+        if report_hash:
+            result['verification_payload_sha256'] = report_hash
+        return result
 
     @api.model
     def _rest_get(self, table, params=None):
@@ -683,18 +935,17 @@ class SoftlifeSyncClient(models.TransientModel):
         if not request_id or not claim_token:
             raise SoftlifeAPIError(_('Platform sync request omitted its ID or lease.'), code='invalid_response')
         try:
-            summary = self.sync_all()
-            accepted = not summary.startswith('Skipped:') and ' Errors:' not in summary
-            result = {
-                'accepted': accepted, 'summary': summary, 'claim_token': claim_token,
-                'error': None if accepted else summary,
+            result = self._dispatch_platform_sync_request(request)
+            result.update({
+                'claim_token': claim_token,
+                'error': None if result['accepted'] else result.get('error') or result['summary'],
                 'finished_at': fields.Datetime.now().isoformat() + 'Z',
-            }
+            })
         except Exception as exc:
             self.env.cr.rollback()
             _logger.exception('SoftLife platform-requested sync %s failed', request_id)
             result = {
-                'accepted': False, 'summary': 'Full Odoo sync raised an exception.', 'claim_token': claim_token,
+                'accepted': False, 'summary': 'Platform-requested Odoo operation failed.', 'claim_token': claim_token,
                 'error': str(exc), 'finished_at': fields.Datetime.now().isoformat() + 'Z',
             }
         self.env.cr.commit()
@@ -704,6 +955,35 @@ class SoftlifeSyncClient(models.TransientModel):
         )
         self.env.cr.commit()
         return self._retry_pending_platform_sync_result()
+
+    @api.model
+    def _dispatch_platform_sync_request(self, request):
+        kind = request.get('kind')
+        if kind == 'stock_snapshot':
+            summary = self.sync_all()
+            accepted = not summary.startswith('Skipped:') and ' Errors:' not in summary
+            return {'accepted': accepted, 'summary': summary}
+        if kind == 'fiscal_product_remediation':
+            payload = request.get('payload')
+            payload_hash = request.get('payload_sha256')
+            if (
+                not isinstance(payload_hash, str)
+                or not re.fullmatch(r'[0-9a-f]{64}', payload_hash)
+                or hashlib.sha256(json.dumps(
+                    payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+                ).encode()).hexdigest() != payload_hash
+            ):
+                return {
+                    'accepted': False,
+                    'summary': _('Rejected fiscal product remediation with an invalid frozen payload hash.'),
+                    'error': _('Fiscal product remediation payload hash mismatch.'),
+                }
+            return self.remediate_fiscal_products(payload)
+        return {
+            'accepted': False,
+            'summary': _('Rejected unsupported platform request kind: %s') % (kind or '<missing>'),
+            'error': _('Unsupported platform request kind.'),
+        }
 
     @api.model
     def _retry_pending_platform_sync_result(self):

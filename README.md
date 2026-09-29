@@ -61,6 +61,7 @@ but manufacturing-period sales orders are now the only automatic revenue sync.
 - **Platform App URL** — application origin hosting `/api/internal/odoo/*`; this is not the Supabase URL
 - **Odoo Sync Secret** — shared `ODOO_SYNC_SECRET`, sent only as `x-odoo-sync-secret`
 - **Fiscal configuration reporting** — disabled by default; explicitly enable it to allow the read-only hourly report
+- **Allow platform-requested fiscal product configuration repairs** — a separate, disabled-by-default opt-in for narrowly scoped income-account and sales-tax repairs
 - **Fiscal issuing company** — required in multi-company databases; choose the legal entity that owns `VEND`
 
 Use **SoftLife → Create Manufacturing Period** for an inclusive date range and
@@ -78,6 +79,14 @@ When explicitly enabled, an hourly fiscal-configuration report verifies the issu
 sales journal, final-consumer customer, 10% sales tax, effective finished-product
 income accounts, and customer taxes against the platform's read-only invoicing
 preflight contract. This report does not create or post invoices.
+
+Fiscal product remediation is independently gated and fail-closed. A request must
+name the current fiscal company, final-consumer customer, exact existing income
+account and sales tax, and no more than 500 existing SoftLife products. The
+connector validates the complete batch before changing anything, rejects unsafe
+partial multi-variant templates, preserves taxes from other companies, verifies
+the effective customer fiscal-position result, and submits a fresh configuration
+report. It never creates products, accounts, taxes, sales, invoices, or postings.
 
 ### Package content and recipe dosage
 

@@ -1,3 +1,5 @@
+import hashlib
+import json
 from unittest.mock import patch
 
 from odoo.tests.common import TransactionCase
@@ -13,7 +15,7 @@ class TestSyncRequests(TransactionCase):
     def test_processes_platform_request_and_posts_success(self):
         Client = type(self.client)
         with patch.object(Client, '_api_request', side_effect=[
-            {'request': {'id': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264', 'claim_token': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3'}},
+            {'request': {'id': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264', 'claim_token': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3', 'kind': 'stock_snapshot'}},
             {'request': {'status': 'completed'}},
         ]) as api, patch.object(Client, 'sync_all', return_value='Synced all warehouse stock.'), \
                 patch.object(Client, '_acquire_sync_lock', return_value=True), \
@@ -31,7 +33,7 @@ class TestSyncRequests(TransactionCase):
         Client = type(self.client)
         summary = 'Synced 3 product(s). Errors: odoo_lot_stock: invalid product stock row'
         with patch.object(Client, '_api_request', side_effect=[
-            {'request': {'id': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3', 'claim_token': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264'}},
+            {'request': {'id': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3', 'claim_token': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264', 'kind': 'stock_snapshot'}},
             {'request': {'status': 'failed'}},
         ]), patch.object(Client, 'sync_all', return_value=summary), \
                 patch.object(Client, '_acquire_sync_lock', return_value=True), \
@@ -45,7 +47,7 @@ class TestSyncRequests(TransactionCase):
         Client = type(self.client)
         summary = 'Synced 3 product(s). Warnings: machines: ingredient has no linked Odoo product'
         with patch.object(Client, '_api_request', side_effect=[
-            {'request': {'id': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3', 'claim_token': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264'}},
+            {'request': {'id': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3', 'claim_token': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264', 'kind': 'stock_snapshot'}},
             {'request': {'status': 'completed'}},
         ]), patch.object(Client, 'sync_all', return_value=summary), \
                 patch.object(Client, '_acquire_sync_lock', return_value=True), \
@@ -55,6 +57,44 @@ class TestSyncRequests(TransactionCase):
         self.assertTrue(result['accepted'])
         self.assertIsNone(result['error'])
         self.assertEqual(result['summary'], summary)
+
+    def test_dispatches_remediation_without_full_sync(self):
+        Client = type(self.client)
+        expected = {'accepted': True, 'summary': 'remediated'}
+        payload = {'contract_version': 1}
+        payload_hash = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(',', ':'),
+        ).encode()).hexdigest()
+        with patch.object(Client, 'remediate_fiscal_products', return_value=expected) as remediate, \
+                patch.object(Client, 'sync_all') as sync_all:
+            result = self.client._dispatch_platform_sync_request({
+                'kind': 'fiscal_product_remediation', 'payload': payload,
+                'payload_sha256': payload_hash,
+            })
+        self.assertEqual(result, expected)
+        remediate.assert_called_once_with(payload)
+        sync_all.assert_not_called()
+
+    def test_rejects_remediation_payload_hash_mismatch(self):
+        Client = type(self.client)
+        with patch.object(Client, 'sync_all') as sync_all, \
+                patch.object(Client, 'remediate_fiscal_products') as remediate:
+            result = self.client._dispatch_platform_sync_request({
+                'kind': 'fiscal_product_remediation', 'payload': {'contract_version': 1},
+                'payload_sha256': '0' * 64,
+            })
+        self.assertFalse(result['accepted'])
+        sync_all.assert_not_called()
+        remediate.assert_not_called()
+
+    def test_unknown_request_kind_fails_closed(self):
+        Client = type(self.client)
+        with patch.object(Client, 'sync_all') as sync_all, \
+                patch.object(Client, 'remediate_fiscal_products') as remediate:
+            result = self.client._dispatch_platform_sync_request({'kind': 'future_operation'})
+        self.assertFalse(result['accepted'])
+        sync_all.assert_not_called()
+        remediate.assert_not_called()
 
     def test_full_sync_labels_mapping_issues_as_warnings(self):
         Client = type(self.client)

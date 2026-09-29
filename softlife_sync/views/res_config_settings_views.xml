@@ -30,6 +30,11 @@
                                      help="Off by default. When enabled, sends one read-only configuration report per hour. It cannot create or post invoices.">
                                 <field name="softlife_fiscal_reporting_enabled"/>
                             </setting>
+                            <setting id="softlife_fiscal_product_remediation"
+                                     string="Allow platform-requested fiscal product configuration repairs"
+                                     help="Off by default. Allows validated platform requests to repair only existing SoftLife product income accounts and sales taxes. This is separate from read-only reporting.">
+                                <field name="softlife_fiscal_product_remediation_enabled"/>
+                            </setting>
                             <setting id="softlife_fiscal_company" string="Fiscal issuing company"
                                      help="Choose the legal entity that owns VEND and will issue the vending invoices.">
                                 <field name="softlife_fiscal_company_id" options="{'no_create': True}"/>
