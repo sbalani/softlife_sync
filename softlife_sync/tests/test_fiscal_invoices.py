@@ -22,7 +22,7 @@ class TestFiscalInvoices(TransactionCase):
             payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False,
         ).encode()).hexdigest()
 
-    def _records_and_payload(self, invoice_count=1, price_include=True):
+    def _records_and_payload(self, invoice_count=1, price_include=True, zero_value=False, quantity=1):
         company = self.env.company
         country = company.account_fiscal_country_id
         if not country or country.code != 'ES' or company.currency_id.name != 'EUR':
@@ -66,16 +66,20 @@ class TestFiscalInvoices(TransactionCase):
             },
         }
         invoices = []
+        gross_cents = 0 if zero_value else 1100
+        tax_base_cents = 0 if zero_value else 1000
+        vat_cents = 0 if zero_value else 100
         for index in range(invoice_count):
             invoice = {
                 'platform_invoice_id': str(uuid.uuid4()),
                 'move_type': 'out_invoice', 'invoice_date': '2026-09-29',
                 'currency': 'EUR', 'reference': f'SoftLife fiscal {index + 1}',
-                'expected_total_cents': 1100,
+                'expected_total_cents': gross_cents,
+                'zero_value_reason': 'free' if zero_value else None,
                 'lines': [{
                     'odoo_product_id': product.id, 'description': f'Fiscal sale {index + 1}',
-                    'quantity': 1, 'gross_cents': 1100, 'tax_base_cents': 1000,
-                    'vat_cents': 100, 'odoo_tax_id': tax.id,
+                    'quantity': quantity, 'gross_cents': gross_cents, 'tax_base_cents': tax_base_cents,
+                    'vat_cents': vat_cents, 'odoo_tax_id': tax.id,
                 }],
             }
             invoice['invoice_payload_sha256'] = self._hash(invoice)
@@ -137,6 +141,28 @@ class TestFiscalInvoices(TransactionCase):
             ('softlife_fiscal_invoice_id', '!=', False),
         ]), before)
 
+    def test_zero_value_reason_is_required_and_exact(self):
+        Client = type(self.client)
+        cases = [
+            (True, None),
+            (True, 'unsupported'),
+            (False, 'free'),
+        ]
+        for zero_value, reason in cases:
+            company, journal, customer, tax, product, contract, payload = \
+                self._records_and_payload(zero_value=zero_value)
+            invoice = payload['invoices'][0]
+            if reason is None:
+                invoice.pop('zero_value_reason')
+            else:
+                invoice['zero_value_reason'] = reason
+            invoice['invoice_payload_sha256'] = self._hash({
+                key: value for key, value in invoice.items()
+                if key != 'invoice_payload_sha256'
+            })
+            with self.assertRaisesRegex(SoftlifeAPIError, 'zero-value reason is invalid'):
+                self.client._validate_fiscal_invoice_draft_payload(payload, contract)
+
     def test_creates_exact_draft_and_idempotently_reuses_it(self):
         company, journal, customer, tax, product, contract, payload = \
             self._records_and_payload()
@@ -163,6 +189,46 @@ class TestFiscalInvoices(TransactionCase):
         self.assertTrue(first['invoices'][0]['created'])
         self.assertFalse(second['invoices'][0]['created'])
         self.assertEqual(first['invoices'][0]['odoo_move_id'], second['invoices'][0]['odoo_move_id'])
+
+    def test_positive_legacy_payload_without_zero_value_reason_is_accepted(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        invoice = payload['invoices'][0]
+        invoice.pop('zero_value_reason')
+        invoice['invoice_payload_sha256'] = self._hash({
+            key: value for key, value in invoice.items()
+            if key != 'invoice_payload_sha256'
+        })
+        Client = type(self.client)
+        with patch.object(Client, '_fiscal_invoice_draft_creation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract):
+            result = self.client._create_fiscal_invoice_drafts(payload)
+        self.assertEqual(result['invoices'][0]['state'], 'draft')
+
+    def test_creates_and_posts_zero_value_invoice(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload(zero_value=True, quantity=2)
+        Client = type(self.client)
+        with patch.object(Client, '_fiscal_invoice_draft_creation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract):
+            draft = self.client._create_fiscal_invoice_drafts(payload)['invoices'][0]
+        move = self.env['account.move'].browse(draft['odoo_move_id'])
+        self.assertEqual(move.invoice_line_ids.quantity, 2)
+        self.assertEqual(move.invoice_line_ids.price_unit, 0)
+        self.assertEqual(self.client._amount_cents(move.amount_total), 0)
+        confirmation = {
+            'contract_version': 1, 'company': {'odoo_id': company.id},
+            'invoices': [{
+                'platform_invoice_id': draft['platform_invoice_id'],
+                'odoo_move_id': draft['odoo_move_id'],
+                'invoice_payload_sha256': draft['invoice_payload_sha256'],
+            }],
+        }
+        with patch.object(Client, '_fiscal_invoice_confirmation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract):
+            result = self.client._confirm_fiscal_invoices(confirmation)
+        self.assertTrue(result['accepted'])
+        self.assertEqual(move.state, 'posted')
 
     def test_existing_identity_with_changed_hash_is_rejected(self):
         company, journal, customer, tax, product, contract, payload = \

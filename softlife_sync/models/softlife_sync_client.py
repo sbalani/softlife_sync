@@ -189,6 +189,7 @@ class SoftlifeSyncClient(models.TransientModel):
                 'fiscal_product_remediation': 1,
                 'fiscal_invoice_draft_creation': 1,
                 'fiscal_invoice_bulk_confirmation': 1,
+                'fiscal_zero_value_invoices': 1,
             },
             'checked_at': fields.Datetime.now().isoformat() + 'Z',
             'company': {
@@ -435,6 +436,10 @@ class SoftlifeSyncClient(models.TransientModel):
     @staticmethod
     def _positive_int(value):
         return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    @staticmethod
+    def _nonnegative_int(value):
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
     @staticmethod
     def _number(value):
@@ -699,9 +704,12 @@ class SoftlifeSyncClient(models.TransientModel):
         invoice_ids = set()
         product_ids = set()
         for invoice in invoices:
-            if not isinstance(invoice, dict) or set(invoice) != {
-                    'platform_invoice_id', 'invoice_payload_sha256', 'move_type', 'invoice_date',
-                    'currency', 'reference', 'expected_total_cents', 'lines'}:
+            invoice_fields = {
+                'platform_invoice_id', 'invoice_payload_sha256', 'move_type', 'invoice_date',
+                'currency', 'reference', 'expected_total_cents', 'lines',
+            }
+            if not isinstance(invoice, dict) or set(invoice) not in (
+                    invoice_fields, invoice_fields | {'zero_value_reason'}):
                 self._fiscal_invoice_error(_('Fiscal invoice fields are invalid.'))
             platform_id = invoice['platform_invoice_id']
             try:
@@ -717,7 +725,7 @@ class SoftlifeSyncClient(models.TransientModel):
                 or self._canonical_sha256(frozen_invoice) != invoice_hash
                 or invoice['move_type'] != 'out_invoice' or invoice['currency'] != 'EUR'
                 or not isinstance(invoice['reference'], str) or not invoice['reference'].strip()
-                or not self._positive_int(invoice['expected_total_cents'])
+                or not self._nonnegative_int(invoice['expected_total_cents'])
                 or not isinstance(invoice['invoice_date'], str)
                 or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', invoice['invoice_date'])
             ):
@@ -728,6 +736,12 @@ class SoftlifeSyncClient(models.TransientModel):
             except ValueError:
                 self._fiscal_invoice_error(_('Fiscal invoice date is invalid.'))
             lines = invoice['lines']
+            zero_value_reason = invoice.get('zero_value_reason')
+            if (
+                zero_value_reason not in (None, 'free', 'admin_override')
+                or (invoice['expected_total_cents'] == 0) != (zero_value_reason is not None)
+            ):
+                self._fiscal_invoice_error(_('Fiscal invoice zero-value reason is invalid.'))
             if not isinstance(lines, list) or not 1 <= len(lines) <= 100:
                 self._fiscal_invoice_error(_('Fiscal invoice requires 1 to 100 lines.'))
             gross_total = 0
@@ -740,7 +754,7 @@ class SoftlifeSyncClient(models.TransientModel):
                     not self._positive_int(line['odoo_product_id'])
                     or not isinstance(line['description'], str) or not line['description'].strip()
                     or not self._positive_int(line['quantity'])
-                    or not self._positive_int(line['gross_cents'])
+                    or not self._nonnegative_int(line['gross_cents'])
                     or not isinstance(line['tax_base_cents'], int)
                     or isinstance(line['tax_base_cents'], bool) or line['tax_base_cents'] < 0
                     or not isinstance(line['vat_cents'], int) or isinstance(line['vat_cents'], bool)

@@ -112,6 +112,10 @@ retries of already posted invoices succeed. Unrelated drafts are never included.
 Creation and confirmation remain disabled unless their respective settings are
 enabled, and enabling either requires an explicit fiscal company.
 
+Completed Huaxin Free and Admin override vends are retained as zero-value customer
+invoices. Their product quantity remains on the invoice for the accounting trail.
+The invoice itself does not create or alter stock movements.
+
 ### Package content and recipe dosage
 
 Ingredient inventory remains in its existing Odoo UoM (normally **Units**).
