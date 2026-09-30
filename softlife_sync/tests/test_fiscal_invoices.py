@@ -163,6 +163,17 @@ class TestFiscalInvoices(TransactionCase):
             with self.assertRaisesRegex(SoftlifeAPIError, 'zero-value reason is invalid'):
                 self.client._validate_fiscal_invoice_draft_payload(payload, contract)
 
+    def test_coupon_zero_value_reason_is_accepted(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload(zero_value=True)
+        invoice = payload['invoices'][0]
+        invoice['zero_value_reason'] = 'coupon'
+        invoice['invoice_payload_sha256'] = self._hash({
+            key: value for key, value in invoice.items()
+            if key != 'invoice_payload_sha256'
+        })
+        self.client._validate_fiscal_invoice_draft_payload(payload, contract)
+
     def test_creates_exact_draft_and_idempotently_reuses_it(self):
         company, journal, customer, tax, product, contract, payload = \
             self._records_and_payload()

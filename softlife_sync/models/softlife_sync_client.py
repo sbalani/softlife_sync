@@ -189,7 +189,7 @@ class SoftlifeSyncClient(models.TransientModel):
                 'fiscal_product_remediation': 1,
                 'fiscal_invoice_draft_creation': 1,
                 'fiscal_invoice_bulk_confirmation': 1,
-                'fiscal_zero_value_invoices': 1,
+                'fiscal_zero_value_invoices': 2,
             },
             'checked_at': fields.Datetime.now().isoformat() + 'Z',
             'company': {
@@ -738,7 +738,7 @@ class SoftlifeSyncClient(models.TransientModel):
             lines = invoice['lines']
             zero_value_reason = invoice.get('zero_value_reason')
             if (
-                zero_value_reason not in (None, 'free', 'admin_override')
+                zero_value_reason not in (None, 'free', 'admin_override', 'coupon')
                 or (invoice['expected_total_cents'] == 0) != (zero_value_reason is not None)
             ):
                 self._fiscal_invoice_error(_('Fiscal invoice zero-value reason is invalid.'))

@@ -77,6 +77,9 @@ per recipe version, one MO per export/warehouse/version/currency, and one sales
 order per export/warehouse. Sales orders are confirmed and deliveries validated;
 this module never creates an invoice from a manufacturing period.
 
+Fiscal invoice batches preserve quantity for audited zero-value Free, Admin override,
+and Huaxin coupon (`串码支付`) vends. Other zero-total payment types remain blocked.
+
 When explicitly enabled, an hourly fiscal-configuration report verifies the issuing company, `VEND`
 sales journal, final-consumer customer, 10% sales tax, effective finished-product
 income accounts, and customer taxes against the platform's read-only invoicing
@@ -112,9 +115,9 @@ retries of already posted invoices succeed. Unrelated drafts are never included.
 Creation and confirmation remain disabled unless their respective settings are
 enabled, and enabling either requires an explicit fiscal company.
 
-Completed Huaxin Free and Admin override vends are retained as zero-value customer
-invoices. Their product quantity remains on the invoice for the accounting trail.
-The invoice itself does not create or alter stock movements.
+Completed Huaxin Free, Admin override, and coupon (`串码支付`) vends are retained
+as zero-value customer invoices. Their product quantity remains on the invoice for
+the accounting trail. The invoice itself does not create or alter stock movements.
 
 ### Package content and recipe dosage
 
