@@ -270,7 +270,7 @@ class TestFiscalInvoices(TransactionCase):
             move.write({'ref': 'Manual edit'})
         self.assertEqual(move.state, 'draft')
 
-    def test_confirmation_requires_secure_posted_entry_journal(self):
+    def test_confirmation_supports_standard_sales_journal(self):
         company, journal, customer, tax, product, contract, payload = \
             self._records_and_payload()
         Client = type(self.client)
@@ -288,9 +288,9 @@ class TestFiscalInvoices(TransactionCase):
         }
         with patch.object(Client, '_fiscal_invoice_confirmation_enabled', return_value=True), \
                 patch.object(Client, '_api_request', return_value=contract):
-            with self.assertRaisesRegex(SoftlifeAPIError, 'secure posted entries'):
-                self.client._confirm_fiscal_invoices(confirmation)
-        self.assertEqual(self.env['account.move'].browse(draft['odoo_move_id']).state, 'draft')
+            result = self.client._confirm_fiscal_invoices(confirmation)
+        self.assertTrue(result['accepted'])
+        self.assertEqual(self.env['account.move'].browse(draft['odoo_move_id']).state, 'posted')
 
     def test_settings_require_company_for_each_new_opt_in(self):
         Params = self.env['ir.config_parameter'].sudo()

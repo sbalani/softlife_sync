@@ -121,8 +121,6 @@ class AccountMove(models.Model):
             raise UserError(_(
                 'SoftLife fiscal invoices can only be posted by validated platform confirmation.'
             ))
-        if fiscal_moves.filtered(lambda move: not move.journal_id.restrict_mode_hash_table):
-            raise UserError(_('SoftLife fiscal invoices require a secure posted-entry journal.'))
         return super().action_post()
 
 

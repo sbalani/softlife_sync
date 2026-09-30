@@ -107,11 +107,10 @@ process-local authorization.
 Bulk confirmation resolves every invoice by both platform UUID and Odoo move ID,
 validates the complete batch, and posts only the explicitly listed drafts in one
 savepoint after locking them. Confirmation revalidates each persisted snapshot and
-current Odoo structure immediately before posting and again afterward. The current
-sales journal must use Odoo's secure posted-entry hash table. Exact retries of
-already posted invoices succeed. Unrelated drafts are never included. Creation and
-confirmation remain disabled unless their respective settings are enabled, and
-enabling either requires an explicit fiscal company.
+current Odoo structure immediately before posting and again afterward. Exact
+retries of already posted invoices succeed. Unrelated drafts are never included.
+Creation and confirmation remain disabled unless their respective settings are
+enabled, and enabling either requires an explicit fiscal company.
 
 ### Package content and recipe dosage
 

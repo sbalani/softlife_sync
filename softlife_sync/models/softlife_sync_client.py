@@ -889,10 +889,6 @@ class SoftlifeSyncClient(models.TransientModel):
             or payload['company']['odoo_id'] != company.id
         ):
             self._fiscal_invoice_error(_('Fiscal invoice confirmation company does not match Odoo.'))
-        if not journal.restrict_mode_hash_table:
-            self._fiscal_invoice_error(_(
-                'Fiscal invoice confirmation requires secure posted entries on the journal.'
-            ))
         platform_ids = set()
         move_ids = set()
         for row in invoices:
