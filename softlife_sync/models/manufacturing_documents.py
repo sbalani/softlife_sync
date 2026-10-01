@@ -86,3 +86,8 @@ class SaleOrderLine(models.Model):
     _inherit = 'sale.order.line'
 
     softlife_rounding_adjustment = fields.Boolean(copy=False)
+
+    def _compute_invoice_status(self):
+        super()._compute_invoice_status()
+        for line in self.filtered('softlife_rounding_adjustment'):
+            line.invoice_status = 'invoiced'

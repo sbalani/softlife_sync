@@ -369,6 +369,128 @@ class TestFiscalInvoices(TransactionCase):
         self.assertTrue(result['accepted'])
         self.assertEqual(self.env['account.move'].browse(draft['odoo_move_id']).state, 'posted')
 
+    def test_posted_invoice_links_to_verified_softlife_sales_order(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        Client = type(self.client)
+        with patch.object(Client, '_fiscal_invoice_draft_creation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract):
+            draft = self.client._create_fiscal_invoice_drafts(payload)['invoices'][0]
+        confirmation = {
+            'contract_version': 1, 'company': {'odoo_id': company.id},
+            'invoices': [{
+                'platform_invoice_id': draft['platform_invoice_id'],
+                'odoo_move_id': draft['odoo_move_id'],
+                'invoice_payload_sha256': draft['invoice_payload_sha256'],
+            }],
+        }
+        with patch.object(Client, '_fiscal_invoice_confirmation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract):
+            self.client._confirm_fiscal_invoices(confirmation)
+
+        warehouse = self.env['stock.warehouse'].search([
+            ('company_id', '=', company.id),
+        ], limit=1)
+        if not warehouse:
+            self.skipTest('Test company has no warehouse.')
+        source_order_id = str(uuid.uuid4())
+        export_id = str(uuid.uuid4())
+        sale = self.env['sale.order'].create({
+            'partner_id': customer.id,
+            'warehouse_id': warehouse.id,
+            'date_order': '2026-09-29 00:00:00',
+            'softlife_export_id': export_id,
+            'softlife_warehouse_id': warehouse.id,
+            'softlife_source_orders': [{
+                'platform_order_id': source_order_id,
+                'order_code': 'TEST-ORDER',
+                'machine_id': str(uuid.uuid4()),
+                'machine_imei': 'TEST-IMEI',
+                'machine_name': 'Test machine',
+            }],
+            'order_line': [(0, 0, {
+                'product_id': product.id,
+                'product_uom_qty': 1,
+                'product_uom': product.uom_id.id,
+                'price_unit': 11,
+                'tax_id': [(6, 0, [])],
+            })],
+        })
+        sale.action_confirm()
+        link_payload = {
+            'contract_version': 1,
+            'local_month': '2026-09',
+            'links': [{
+                'platform_invoice_id': draft['platform_invoice_id'],
+                'invoice_payload_sha256': draft['invoice_payload_sha256'],
+                'odoo_move_id': draft['odoo_move_id'],
+                'source_order_id': source_order_id,
+                'export_id': export_id,
+                'recipe_version_id': str(uuid.uuid4()),
+                'odoo_warehouse_id': warehouse.id,
+                'odoo_sale_order_id': sale.id,
+                'odoo_product_id': product.id,
+                'quantity': 1,
+            }],
+        }
+        first = self.client._link_fiscal_invoices_to_sales(link_payload)
+        second = self.client._link_fiscal_invoices_to_sales(link_payload)
+        move = self.env['account.move'].browse(draft['odoo_move_id'])
+        self.assertEqual(move.invoice_line_ids.sale_line_ids, sale.order_line)
+        self.assertIn(move, sale.invoice_ids)
+        self.assertEqual(sale.invoice_status, 'invoiced')
+        self.assertTrue(first['links'][0]['linked'])
+        self.assertFalse(first['links'][0]['already_linked'])
+        self.assertTrue(second['links'][0]['already_linked'])
+
+    def test_sale_link_rejects_wrong_source_without_mutation(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        Client = type(self.client)
+        with patch.object(Client, '_fiscal_invoice_draft_creation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract):
+            draft = self.client._create_fiscal_invoice_drafts(payload)['invoices'][0]
+        confirmation = {
+            'contract_version': 1, 'company': {'odoo_id': company.id},
+            'invoices': [{
+                'platform_invoice_id': draft['platform_invoice_id'],
+                'odoo_move_id': draft['odoo_move_id'],
+                'invoice_payload_sha256': draft['invoice_payload_sha256'],
+            }],
+        }
+        with patch.object(Client, '_fiscal_invoice_confirmation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract):
+            self.client._confirm_fiscal_invoices(confirmation)
+        warehouse = self.env['stock.warehouse'].search([('company_id', '=', company.id)], limit=1)
+        if not warehouse:
+            self.skipTest('Test company has no warehouse.')
+        sale = self.env['sale.order'].create({
+            'partner_id': customer.id, 'warehouse_id': warehouse.id,
+            'softlife_export_id': str(uuid.uuid4()), 'softlife_warehouse_id': warehouse.id,
+            'softlife_source_orders': [{'platform_order_id': str(uuid.uuid4())}],
+            'order_line': [(0, 0, {'product_id': product.id, 'product_uom_qty': 1, 'price_unit': 11, 'tax_id': [(6, 0, [])]})],
+        })
+        sale.action_confirm()
+        link_payload = {
+            'contract_version': 1, 'local_month': '2026-09',
+            'links': [{
+                'platform_invoice_id': draft['platform_invoice_id'],
+                'invoice_payload_sha256': draft['invoice_payload_sha256'],
+                'odoo_move_id': draft['odoo_move_id'],
+                'source_order_id': str(uuid.uuid4()),
+                'export_id': sale.softlife_export_id,
+                'recipe_version_id': str(uuid.uuid4()),
+                'odoo_warehouse_id': warehouse.id,
+                'odoo_sale_order_id': sale.id,
+                'odoo_product_id': product.id,
+                'quantity': 1,
+            }],
+        }
+        with self.assertRaisesRegex(SoftlifeAPIError, 'does not contain'):
+            self.client._link_fiscal_invoices_to_sales(link_payload)
+        self.assertFalse(self.env['account.move'].browse(
+            draft['odoo_move_id']).invoice_line_ids.sale_line_ids)
+
     def test_settings_require_company_for_each_new_opt_in(self):
         Params = self.env['ir.config_parameter'].sudo()
         Params.set_param('softlife.sync.fiscal_company_id', '')

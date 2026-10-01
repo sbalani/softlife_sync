@@ -12,8 +12,9 @@ import uuid
 from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import urljoin
 
-from odoo import _, api, fields, models
+from odoo import Command, _, api, fields, models
 from odoo.exceptions import UserError
+from odoo.tools.float_utils import float_compare
 
 from .account_move import _softlife_fiscal_internal_scope
 
@@ -997,6 +998,167 @@ class SoftlifeSyncClient(models.TransientModel):
         }
 
     @api.model
+    def _link_fiscal_invoices_to_sales(self, payload):
+        if not isinstance(payload, dict) or set(payload) != {
+                'contract_version', 'local_month', 'links'}:
+            self._fiscal_invoice_error(_('Fiscal sale-link payload fields are invalid.'))
+        if payload['contract_version'] != 1 or isinstance(payload['contract_version'], bool):
+            self._fiscal_invoice_error(_('Fiscal sale-link contract version is unsupported.'))
+        if not isinstance(payload['local_month'], str) or not re.fullmatch(
+                r'\d{4}-(0[1-9]|1[0-2])', payload['local_month']):
+            self._fiscal_invoice_error(_('Fiscal sale-link month is invalid.'))
+        links = payload['links']
+        if not isinstance(links, list) or not 1 <= len(links) <= 500:
+            self._fiscal_invoice_error(_('Fiscal sale-link request requires 1 to 500 links.'))
+
+        invoice_ids = set()
+        move_ids = set()
+        sale_ids = set()
+        for link in links:
+            required = {
+                'platform_invoice_id', 'invoice_payload_sha256', 'odoo_move_id',
+                'source_order_id', 'export_id', 'recipe_version_id', 'odoo_warehouse_id',
+                'odoo_sale_order_id', 'odoo_product_id', 'quantity',
+            }
+            if not isinstance(link, dict) or set(link) != required:
+                self._fiscal_invoice_error(_('Fiscal sale-link row fields are invalid.'))
+            try:
+                valid_invoice_id = str(uuid.UUID(link['platform_invoice_id'])) == link['platform_invoice_id']
+                valid_source_id = str(uuid.UUID(link['source_order_id'])) == link['source_order_id']
+                valid_export_id = str(uuid.UUID(link['export_id'])) == link['export_id']
+                valid_recipe_version_id = str(uuid.UUID(
+                    link['recipe_version_id'])) == link['recipe_version_id']
+            except (ValueError, TypeError, AttributeError):
+                valid_invoice_id = valid_source_id = valid_export_id = \
+                    valid_recipe_version_id = False
+            if (
+                not valid_invoice_id or not valid_source_id or not valid_export_id
+                or not valid_recipe_version_id
+                or link['platform_invoice_id'] in invoice_ids
+                or not isinstance(link['invoice_payload_sha256'], str)
+                or not re.fullmatch(r'[0-9a-f]{64}', link['invoice_payload_sha256'])
+                or not self._positive_int(link['odoo_move_id'])
+                or link['odoo_move_id'] in move_ids
+                or not self._positive_int(link['odoo_warehouse_id'])
+                or not self._positive_int(link['odoo_sale_order_id'])
+                or not self._positive_int(link['odoo_product_id'])
+                or not self._positive_int(link['quantity'])
+            ):
+                self._fiscal_invoice_error(_('Fiscal sale-link identity is invalid.'))
+            invoice_ids.add(link['platform_invoice_id'])
+            move_ids.add(link['odoo_move_id'])
+            sale_ids.add(link['odoo_sale_order_id'])
+
+        self.env.cr.execute('SELECT id FROM account_move WHERE id IN %s FOR UPDATE', [tuple(move_ids)])
+        if {row[0] for row in self.env.cr.fetchall()} != move_ids:
+            self._fiscal_invoice_error(_('Fiscal sale-link request contains an unknown invoice.'))
+        self.env.cr.execute('SELECT id FROM sale_order WHERE id IN %s FOR UPDATE', [tuple(sale_ids)])
+        if {row[0] for row in self.env.cr.fetchall()} != sale_ids:
+            self._fiscal_invoice_error(_('Fiscal sale-link request contains an unknown sales order.'))
+
+        moves = self.env['account.move'].sudo().browse(list(move_ids))
+        sales = self.env['sale.order'].sudo().browse(list(sale_ids))
+        moves.invalidate_recordset()
+        sales.invalidate_recordset()
+        moves_by_id = {move.id: move for move in moves}
+        sales_by_id = {sale.id: sale for sale in sales}
+        prepared = []
+        planned_by_line = {}
+        for link in links:
+            move = moves_by_id[link['odoo_move_id']]
+            sale = sales_by_id[link['odoo_sale_order_id']]
+            if (
+                move.softlife_fiscal_invoice_id != link['platform_invoice_id']
+                or move.softlife_fiscal_payload_sha256 != link['invoice_payload_sha256']
+                or move.state != 'posted' or move.move_type != 'out_invoice'
+                or sale.state not in ('sale', 'done')
+                or sale.softlife_export_id != link['export_id']
+                or sale.softlife_warehouse_id.id != link['odoo_warehouse_id']
+                or sale.company_id != move.company_id or sale.currency_id != move.currency_id
+                or sale.partner_id != move.partner_id
+            ):
+                self._fiscal_invoice_error(_('Fiscal invoice and sales order identities do not match.'))
+            snapshot = self._validate_fiscal_invoice_snapshot(move)
+            if not str(snapshot.get('invoice_date') or '').startswith(payload['local_month'] + '-'):
+                self._fiscal_invoice_error(_('Fiscal invoice date does not match the reconciliation month.'))
+            sources = sale.softlife_source_orders or []
+            if link['source_order_id'] not in {
+                    str(source.get('platform_order_id') or '')
+                    for source in sources if isinstance(source, dict)}:
+                self._fiscal_invoice_error(_('Sales order does not contain the fiscal invoice source order.'))
+            invoice_lines = move.invoice_line_ids.filtered(lambda line: line.display_type == 'product')
+            if len(invoice_lines) != 1:
+                self._fiscal_invoice_error(_('Fiscal invoice must contain exactly one product line.'))
+            invoice_line = invoice_lines[0]
+            sale_lines = sale.order_line.filtered(
+                lambda line: not line.display_type and not line.softlife_rounding_adjustment
+                and line.product_id.id == link['odoo_product_id'])
+            if (
+                len(sale_lines) != 1
+                or invoice_line.product_id.id != link['odoo_product_id']
+                or invoice_line.quantity != link['quantity']
+            ):
+                self._fiscal_invoice_error(_('Fiscal invoice product or quantity does not match one sales line.'))
+            sale_line = sale_lines[0]
+            if invoice_line.sale_line_ids and invoice_line.sale_line_ids != sale_line:
+                self._fiscal_invoice_error(_('Fiscal invoice line is already linked to another sales line.'))
+            planned_by_line.setdefault(sale_line, []).append(invoice_line)
+            prepared.append((link, move, sale, invoice_line, sale_line, bool(invoice_line.sale_line_ids)))
+
+        for sale_line, invoice_lines in planned_by_line.items():
+            existing = sale_line.invoice_lines.filtered(lambda line: line.move_id.state != 'cancel')
+            planned = self.env['account.move.line'].browse([line.id for line in invoice_lines]) - existing
+            combined = existing | planned
+            if combined.filtered(
+                    lambda line: line.product_uom_id.category_id != sale_line.product_uom.category_id):
+                self._fiscal_invoice_error(_('Fiscal invoice and sales line units of measure are incompatible.'))
+            invoiced = sum(
+                (-1 if line.move_id.move_type == 'out_refund' else 1)
+                * line.product_uom_id._compute_quantity(
+                    line.quantity, sale_line.product_uom, round=False)
+                for line in combined
+                if line.move_id.move_type in ('out_invoice', 'out_refund')
+            )
+            if float_compare(
+                    invoiced, sale_line.product_uom_qty,
+                    precision_rounding=sale_line.product_uom.rounding) > 0:
+                self._fiscal_invoice_error(_('Fiscal invoice links would exceed the sales-order quantity.'))
+
+        with self.env.cr.savepoint(), _softlife_fiscal_internal_scope():
+            for _link, _move, _sale, invoice_line, sale_line, already_linked in prepared:
+                if not already_linked:
+                    invoice_line.write({'sale_line_ids': [Command.link(sale_line.id)]})
+            sales.invalidate_recordset(['invoice_ids', 'invoice_status'])
+            sales.mapped('order_line').invalidate_recordset([
+                'invoice_lines', 'qty_invoiced', 'qty_to_invoice', 'invoice_status',
+            ])
+            results = []
+            for link, move, sale, invoice_line, sale_line, already_linked in prepared:
+                if invoice_line.sale_line_ids != sale_line or move not in sale.invoice_ids:
+                    self._fiscal_invoice_error(_('Odoo did not retain the fiscal invoice sales link.'))
+                results.append({
+                    'platform_invoice_id': link['platform_invoice_id'],
+                    'invoice_payload_sha256': link['invoice_payload_sha256'],
+                    'odoo_move_id': move.id,
+                    'odoo_sale_order_id': sale.id,
+                    'odoo_sale_order_line_id': sale_line.id,
+                    'linked': True,
+                    'already_linked': already_linked,
+                    'sale_order_status': sale.invoice_status,
+                })
+        fully_invoiced = len(sales.filtered(lambda sale: sale.invoice_status == 'invoiced'))
+        return {
+            'accepted': True,
+            'summary': _(
+                'Linked %(invoices)s existing fiscal invoice(s) to sales orders; '
+                '%(orders)s of %(total)s affected sales orders are fully invoiced.',
+                invoices=len(results), orders=fully_invoiced, total=len(sales),
+            ),
+            'contract_version': 1,
+            'links': results,
+        }
+
+    @api.model
     def _rest_get(self, table, params=None):
         import requests
         base = self._param('softlife.sync.supabase_url').rstrip('/')
@@ -1484,6 +1646,7 @@ class SoftlifeSyncClient(models.TransientModel):
             'fiscal_product_remediation': self.remediate_fiscal_products,
             'fiscal_invoice_draft_creation': self._create_fiscal_invoice_drafts,
             'fiscal_invoice_bulk_confirmation': self._confirm_fiscal_invoices,
+            'fiscal_invoice_sale_link': self._link_fiscal_invoices_to_sales,
         }
         if kind in fiscal_handlers:
             payload = request.get('payload')
