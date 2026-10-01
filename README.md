@@ -80,7 +80,7 @@ this module never creates an invoice from a manufacturing period.
 Fiscal invoice batches preserve quantity for audited zero-value Free, Admin override,
 and Huaxin coupon (`串码支付`) vends. Other zero-total payment types remain blocked.
 Posted fiscal invoice lines can be reconciled to completed SoftLife production sales
-orders from the platform. The connector verifies the immutable invoice UUID and hash,
+orders from the platform. The connector verifies the invoice UUID and Odoo identity,
 export, warehouse, source order, product, and quantity before adding Odoo's standard
 sale-line relation; it does not create, repost, or change accounting values.
 

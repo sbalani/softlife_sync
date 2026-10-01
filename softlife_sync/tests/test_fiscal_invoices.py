@@ -422,7 +422,6 @@ class TestFiscalInvoices(TransactionCase):
             'local_month': '2026-09',
             'links': [{
                 'platform_invoice_id': draft['platform_invoice_id'],
-                'invoice_payload_sha256': draft['invoice_payload_sha256'],
                 'odoo_move_id': draft['odoo_move_id'],
                 'source_order_id': source_order_id,
                 'export_id': export_id,
@@ -475,7 +474,6 @@ class TestFiscalInvoices(TransactionCase):
             'contract_version': 1, 'local_month': '2026-09',
             'links': [{
                 'platform_invoice_id': draft['platform_invoice_id'],
-                'invoice_payload_sha256': draft['invoice_payload_sha256'],
                 'odoo_move_id': draft['odoo_move_id'],
                 'source_order_id': str(uuid.uuid4()),
                 'export_id': sale.softlife_export_id,

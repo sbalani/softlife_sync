@@ -132,6 +132,17 @@ class TestSyncRequests(TransactionCase):
         self.assertFalse(result['accepted'])
         create.assert_not_called()
 
+    def test_dispatches_fiscal_sale_links_without_a_hash(self):
+        Client = type(self.client)
+        payload = {'contract_version': 1, 'local_month': '2026-07', 'links': []}
+        with patch.object(Client, '_link_fiscal_invoices_to_sales', return_value={
+                'accepted': True, 'summary': 'linked'}) as link:
+            result = self.client._dispatch_platform_sync_request({
+                'kind': 'fiscal_invoice_sale_link', 'payload': payload,
+            })
+        self.assertEqual(result['summary'], 'linked')
+        link.assert_called_once_with(payload)
+
     def test_unknown_request_kind_fails_closed(self):
         Client = type(self.client)
         with patch.object(Client, 'sync_all') as sync_all, \

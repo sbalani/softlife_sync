@@ -1016,7 +1016,7 @@ class SoftlifeSyncClient(models.TransientModel):
         sale_ids = set()
         for link in links:
             required = {
-                'platform_invoice_id', 'invoice_payload_sha256', 'odoo_move_id',
+                'platform_invoice_id', 'odoo_move_id',
                 'source_order_id', 'export_id', 'recipe_version_id', 'odoo_warehouse_id',
                 'odoo_sale_order_id', 'odoo_product_id', 'quantity',
             }
@@ -1035,8 +1035,6 @@ class SoftlifeSyncClient(models.TransientModel):
                 not valid_invoice_id or not valid_source_id or not valid_export_id
                 or not valid_recipe_version_id
                 or link['platform_invoice_id'] in invoice_ids
-                or not isinstance(link['invoice_payload_sha256'], str)
-                or not re.fullmatch(r'[0-9a-f]{64}', link['invoice_payload_sha256'])
                 or not self._positive_int(link['odoo_move_id'])
                 or link['odoo_move_id'] in move_ids
                 or not self._positive_int(link['odoo_warehouse_id'])
@@ -1069,7 +1067,6 @@ class SoftlifeSyncClient(models.TransientModel):
             sale = sales_by_id[link['odoo_sale_order_id']]
             if (
                 move.softlife_fiscal_invoice_id != link['platform_invoice_id']
-                or move.softlife_fiscal_payload_sha256 != link['invoice_payload_sha256']
                 or move.state != 'posted' or move.move_type != 'out_invoice'
                 or sale.state not in ('sale', 'done')
                 or sale.softlife_export_id != link['export_id']
@@ -1138,7 +1135,6 @@ class SoftlifeSyncClient(models.TransientModel):
                     self._fiscal_invoice_error(_('Odoo did not retain the fiscal invoice sales link.'))
                 results.append({
                     'platform_invoice_id': link['platform_invoice_id'],
-                    'invoice_payload_sha256': link['invoice_payload_sha256'],
                     'odoo_move_id': move.id,
                     'odoo_sale_order_id': sale.id,
                     'odoo_sale_order_line_id': sale_line.id,
@@ -1646,8 +1642,9 @@ class SoftlifeSyncClient(models.TransientModel):
             'fiscal_product_remediation': self.remediate_fiscal_products,
             'fiscal_invoice_draft_creation': self._create_fiscal_invoice_drafts,
             'fiscal_invoice_bulk_confirmation': self._confirm_fiscal_invoices,
-            'fiscal_invoice_sale_link': self._link_fiscal_invoices_to_sales,
         }
+        if kind == 'fiscal_invoice_sale_link':
+            return self._link_fiscal_invoices_to_sales(request.get('payload'))
         if kind in fiscal_handlers:
             payload = request.get('payload')
             payload_hash = request.get('payload_sha256')
