@@ -47,10 +47,21 @@ class StockPicking(models.Model):
     softlife_export_id = fields.Char(index=True, copy=False)
     softlife_transfer_key = fields.Char(index=True, copy=False)
     softlife_payload_sha256 = fields.Char(copy=False)
+    softlife_stock_movement_group_id = fields.Char(index=True, copy=False)
+    softlife_stock_movement_out_reference = fields.Char(index=True, copy=False)
+    softlife_stock_movement_in_reference = fields.Char(index=True, copy=False)
 
     _sql_constraints = [
         ('softlife_replenishment_key_unique', 'unique(softlife_replenishment_key)',
          'This SoftLife replenishment transfer has already been created.'),
+        ('softlife_stock_movement_group_unique', 'unique(softlife_stock_movement_group_id)',
+         'This SoftLife stock movement group has already been created.'),
+        ('softlife_stock_movement_out_reference_unique',
+         'unique(softlife_stock_movement_out_reference)',
+         'This SoftLife outbound stock movement has already been created.'),
+        ('softlife_stock_movement_in_reference_unique',
+         'unique(softlife_stock_movement_in_reference)',
+         'This SoftLife inbound stock movement has already been created.'),
     ]
 
 

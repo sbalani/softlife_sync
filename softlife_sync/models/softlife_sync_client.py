@@ -9,6 +9,7 @@ import logging
 import math
 import re
 import uuid
+from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import urljoin
 
@@ -36,6 +37,7 @@ class SoftlifeSyncClient(models.TransientModel):
     _description = 'SoftLife Platform Sync (Supabase connector)'
     _sync_lock_id = 731904628
     _pending_sync_result_key = 'softlife.sync.pending_platform_request_result'
+    _stock_movement_retry_minutes = 10
 
     # ------------------------------------------------------------------
     # Config / HTTP
@@ -1335,6 +1337,15 @@ class SoftlifeSyncClient(models.TransientModel):
 
     @api.model
     def sync_odoo_lot_stock(self):
+        reflected_references = []
+        for picking in self.env['stock.picking'].search([
+            ('state', '=', 'done'),
+            ('softlife_stock_movement_group_id', '!=', False),
+        ]):
+            reflected_references.extend(filter(None, (
+                picking.softlife_stock_movement_out_reference,
+                picking.softlife_stock_movement_in_reference,
+            )))
         lot_quantities = {}
         product_quantities = {}
         for quant in self.env['stock.quant'].search([
@@ -1381,11 +1392,345 @@ class SoftlifeSyncClient(models.TransientModel):
             'POST',
             '/api/internal/odoo/lot-stock-snapshot',
             payload={
-                'rows': rows, 'product_rows': product_rows, 'reflected_references': [],
+                'rows': rows, 'product_rows': product_rows,
+                'reflected_references': sorted(set(reflected_references)),
                 'observed_at': fields.Datetime.now().isoformat() + 'Z',
             },
         )
         return len(product_rows)
+
+    @api.model
+    def _stock_movement_worker(self):
+        identity = self._param('database.uuid') or self.env.cr.dbname
+        return 'softlife-odoo:%s' % identity
+
+    @api.model
+    def _group_claimed_stock_movements(self, movements):
+        if not isinstance(movements, list):
+            raise SoftlifeAPIError(_('Platform returned invalid stock movements.'), code='invalid_response')
+        groups = OrderedDict()
+        seen_ids = set()
+        for movement in movements:
+            if not isinstance(movement, dict):
+                raise SoftlifeAPIError(_('Platform returned an invalid stock movement.'), code='invalid_response')
+            movement_id = movement.get('movement_id')
+            lease_token = movement.get('lease_token')
+            if (
+                not isinstance(movement_id, str) or not movement_id.strip()
+                or movement_id in seen_ids
+                or not isinstance(lease_token, str) or not lease_token.strip()
+            ):
+                raise SoftlifeAPIError(_('Platform stock movement identity is invalid.'), code='invalid_response')
+            seen_ids.add(movement_id)
+            operation_id = movement.get('movement_group_id') or movement_id
+            if not isinstance(operation_id, str) or not operation_id.strip():
+                raise SoftlifeAPIError(_('Platform stock movement group is invalid.'), code='invalid_response')
+            groups.setdefault(operation_id, []).append(movement)
+        for rows in groups.values():
+            if len({row['lease_token'] for row in rows}) != 1:
+                raise SoftlifeAPIError(
+                    _('Platform stock movement group has inconsistent leases.'),
+                    code='invalid_response',
+                )
+        return list(groups.values())
+
+    @api.model
+    def _stock_transfer_values(self, rows):
+        if len(rows) != 2 or {row.get('movement_kind') for row in rows} != {
+                'transfer_out', 'transfer_in'}:
+            kinds = sorted(str(row.get('movement_kind') or '<missing>') for row in rows)
+            if not set(kinds).issubset({'transfer_out', 'transfer_in'}):
+                raise SoftlifeAPIError(
+                    _('Unsupported platform stock movement kind(s): %s') % ', '.join(kinds),
+                    code='unsupported_stock_movement',
+                )
+            raise SoftlifeAPIError(
+                _('A platform transfer must contain exactly one outbound and one inbound movement.'),
+                code='invalid_stock_transfer',
+            )
+        outbound = next(row for row in rows if row['movement_kind'] == 'transfer_out')
+        inbound = next(row for row in rows if row['movement_kind'] == 'transfer_in')
+        group_id = outbound.get('movement_group_id')
+        if (
+            not isinstance(group_id, str) or not group_id.strip()
+            or inbound.get('movement_group_id') != group_id
+        ):
+            raise SoftlifeAPIError(
+                _('Paired platform transfers must share a movement group.'),
+                code='invalid_stock_transfer',
+            )
+        references = (outbound.get('external_reference'), inbound.get('external_reference'))
+        if any(not isinstance(reference, str) or not reference.strip() for reference in references) \
+                or references[0] == references[1]:
+            raise SoftlifeAPIError(
+                _('Paired platform transfers require distinct external references.'),
+                code='invalid_stock_transfer',
+            )
+        lot_id = outbound.get('odoo_lot_id')
+        source_id = outbound.get('odoo_warehouse_id')
+        destination_id = inbound.get('odoo_warehouse_id')
+        if (
+            not self._positive_int(lot_id) or inbound.get('odoo_lot_id') != lot_id
+            or not self._positive_int(source_id) or not self._positive_int(destination_id)
+            or source_id == destination_id
+        ):
+            raise SoftlifeAPIError(
+                _('Paired platform transfer lot or warehouses are invalid.'),
+                code='invalid_stock_transfer',
+            )
+        try:
+            outbound_quantity = Decimal(str(outbound.get('quantity')))
+            inbound_quantity = Decimal(str(inbound.get('quantity')))
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            raise SoftlifeAPIError(
+                _('Paired platform transfer quantity is invalid.'), code='invalid_stock_transfer',
+            ) from exc
+        if (
+            not outbound_quantity.is_finite() or not inbound_quantity.is_finite()
+            or outbound_quantity >= 0 or inbound_quantity <= 0
+            or -outbound_quantity != inbound_quantity
+        ):
+            raise SoftlifeAPIError(
+                _('Paired platform transfer requires equal negative outbound and positive inbound quantities.'),
+                code='invalid_stock_transfer',
+            )
+        occurred_at = outbound.get('occurred_at')
+        if not isinstance(occurred_at, str) or inbound.get('occurred_at') != occurred_at:
+            raise SoftlifeAPIError(
+                _('Paired platform transfers require one shared occurrence time.'),
+                code='invalid_stock_transfer',
+            )
+        try:
+            parsed_at = datetime.datetime.fromisoformat(occurred_at.replace('Z', '+00:00'))
+            if parsed_at.tzinfo:
+                parsed_at = parsed_at.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+            occurred_at = fields.Datetime.to_datetime(parsed_at)
+        except (TypeError, ValueError) as exc:
+            raise SoftlifeAPIError(
+                _('Paired platform transfer occurrence time is invalid.'),
+                code='invalid_stock_transfer',
+            ) from exc
+        source = self.env['stock.warehouse'].browse(source_id).exists()
+        destination = self.env['stock.warehouse'].browse(destination_id).exists()
+        lot = self.env['stock.lot'].browse(lot_id).exists()
+        if (
+            not source or not destination or source.company_id != destination.company_id
+            or source.company_id != self.env.company or not source.lot_stock_id
+            or not destination.lot_stock_id or not source.int_type_id
+        ):
+            raise SoftlifeAPIError(
+                _('Paired platform transfer warehouses are unavailable or incompatible.'),
+                code='invalid_stock_transfer',
+            )
+        if not lot or not lot.product_id or lot.product_id.tracking == 'none':
+            raise SoftlifeAPIError(
+                _('Paired platform transfer lot is unavailable or untracked.'),
+                code='invalid_stock_transfer',
+            )
+        quantity = float(inbound_quantity)
+        if lot.product_id.tracking == 'serial' and inbound_quantity != Decimal('1'):
+            raise SoftlifeAPIError(
+                _('Serial-tracked platform transfers require quantity exactly 1.'),
+                code='invalid_stock_transfer',
+            )
+        if float_compare(quantity, 0.0, precision_rounding=lot.product_id.uom_id.rounding) <= 0:
+            raise SoftlifeAPIError(
+                _('Paired platform transfer quantity is below the product precision.'),
+                code='invalid_stock_transfer',
+            )
+        return {
+            'group_id': group_id, 'outbound_reference': references[0],
+            'inbound_reference': references[1], 'source': source, 'destination': destination,
+            'lot': lot, 'product': lot.product_id, 'uom': lot.product_id.uom_id,
+            'quantity': quantity, 'occurred_at': occurred_at,
+        }
+
+    @api.model
+    def _validate_existing_stock_transfer(self, picking, values):
+        move = picking.move_ids
+        actual_lots = {}
+        move_line_date_mismatch = False
+        for line in move.move_line_ids:
+            if line.lot_id:
+                actual_lots[line.lot_id.id] = actual_lots.get(line.lot_id.id, 0.0) + line.quantity
+            if 'date' in line._fields and line.date != values['occurred_at']:
+                move_line_date_mismatch = True
+        if (
+            picking.state != 'done' or len(move) != 1
+            or picking.softlife_stock_movement_group_id != values['group_id']
+            or picking.softlife_stock_movement_out_reference != values['outbound_reference']
+            or picking.softlife_stock_movement_in_reference != values['inbound_reference']
+            or picking.picking_type_id != values['source'].int_type_id
+            or picking.location_id != values['source'].lot_stock_id
+            or picking.location_dest_id != values['destination'].lot_stock_id
+            or picking.date_done != values['occurred_at']
+            or move.product_id != values['product'] or move.product_uom != values['uom']
+            or move.date != values['occurred_at'] or move_line_date_mismatch
+            or float_compare(
+                move.product_uom_qty, values['quantity'], precision_rounding=values['uom'].rounding,
+            )
+            or set(actual_lots) != {values['lot'].id}
+            or float_compare(
+                actual_lots.get(values['lot'].id, 0.0), values['quantity'],
+                precision_rounding=values['uom'].rounding,
+            )
+        ):
+            raise SoftlifeAPIError(
+                _('Existing Odoo transfer does not match the immutable platform movement.'),
+                code='stock_transfer_conflict',
+            )
+
+    @api.model
+    def _process_stock_movement_group(self, rows):
+        values = self._stock_transfer_values(rows)
+        Picking = self.env['stock.picking']
+        existing = Picking.search([
+            '|', '|',
+            ('softlife_stock_movement_group_id', '=', values['group_id']),
+            ('softlife_stock_movement_out_reference', '=', values['outbound_reference']),
+            ('softlife_stock_movement_in_reference', '=', values['inbound_reference']),
+        ], limit=1)
+        if existing:
+            self._validate_existing_stock_transfer(existing, values)
+            return existing
+
+        quant_ids = self.env['stock.quant'].search([
+            ('product_id', '=', values['product'].id),
+            ('location_id', 'child_of', values['source'].lot_stock_id.id),
+            ('lot_id', '=', values['lot'].id),
+        ]).ids
+        if quant_ids:
+            self.env.cr.execute('SELECT id FROM stock_quant WHERE id IN %s FOR UPDATE', [tuple(quant_ids)])
+        available = self.env['stock.quant']._get_available_quantity(
+            values['product'], values['source'].lot_stock_id,
+            lot_id=values['lot'], strict=False,
+        )
+        if float_compare(
+                available, values['quantity'], precision_rounding=values['uom'].rounding) < 0:
+            raise SoftlifeAPIError(
+                _('Platform transfer lot has %(available)s available; %(required)s is required.',
+                  available=available, required=values['quantity']),
+                code='insufficient_stock', retryable=True,
+            )
+        picking = Picking.create({
+            'picking_type_id': values['source'].int_type_id.id,
+            'location_id': values['source'].lot_stock_id.id,
+            'location_dest_id': values['destination'].lot_stock_id.id,
+            'scheduled_date': values['occurred_at'],
+            'origin': 'Platform stock transfer %s' % values['group_id'],
+            'softlife_stock_movement_group_id': values['group_id'],
+            'softlife_stock_movement_out_reference': values['outbound_reference'],
+            'softlife_stock_movement_in_reference': values['inbound_reference'],
+            'move_ids': [Command.create({
+                'name': values['product'].display_name,
+                'product_id': values['product'].id,
+                'product_uom_qty': values['quantity'],
+                'product_uom': values['uom'].id,
+                'location_id': values['source'].lot_stock_id.id,
+                'location_dest_id': values['destination'].lot_stock_id.id,
+                'date': values['occurred_at'],
+            })],
+        })
+        picking.action_confirm()
+        move = picking.move_ids
+        if move.move_line_ids:
+            move._do_unreserve()
+        reserved = move._update_reserved_quantity(
+            values['quantity'], values['source'].lot_stock_id,
+            lot_id=values['lot'], strict=False,
+        )
+        if float_compare(reserved, values['quantity'], precision_rounding=values['uom'].rounding):
+            raise SoftlifeAPIError(
+                _('Odoo could not reserve the complete platform transfer lot.'),
+                code='reservation_failed', retryable=True,
+            )
+        if 'picked' in move._fields:
+            move.picked = True
+        result = picking.with_context(
+            skip_backorder=True, cancel_backorder=False,
+            force_period_date=values['occurred_at'].date(),
+        ).button_validate()
+        if picking.state != 'done' and isinstance(result, dict):
+            raise SoftlifeAPIError(
+                _('Odoo transfer requires an unsupported validation wizard.'),
+                code='validation_wizard', retryable=True,
+            )
+        if picking.state != 'done' or Picking.search([('backorder_id', '=', picking.id)]):
+            raise SoftlifeAPIError(
+                _('Odoo did not complete the platform transfer without a backorder.'),
+                code='incomplete_transfer', retryable=True,
+            )
+        picking.write({'date_done': values['occurred_at']})
+        move.write({'date': values['occurred_at']})
+        if 'date' in move.move_line_ids._fields:
+            move.move_line_ids.write({'date': values['occurred_at']})
+        self._validate_existing_stock_transfer(picking, values)
+        return picking
+
+    @api.model
+    def _stock_movement_error_is_retryable(self, exc):
+        if isinstance(exc, SoftlifeAPIError):
+            return exc.retryable
+        if getattr(exc, 'pgcode', None) in ('40001', '40P01', '55P03'):
+            return True
+        try:
+            import requests
+            if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+                return True
+        except ImportError:
+            pass
+        try:
+            from psycopg2 import OperationalError
+            if isinstance(exc, OperationalError):
+                return True
+        except ImportError:
+            pass
+        return False
+
+    @api.model
+    def process_platform_stock_movements(self, limit=20):
+        worker = self._stock_movement_worker()
+        processed = 0
+        for _index in range(max(1, min(int(limit), 100))):
+            claimed = self._api_request(
+                'POST', '/api/internal/odoo/stock-movements/claim',
+                payload={'worker': worker, 'limit': 1},
+            )
+            groups = self._group_claimed_stock_movements(claimed.get('movements'))
+            if not groups:
+                break
+            if len(groups) != 1:
+                raise SoftlifeAPIError(
+                    _('Platform returned more than one stock operation for a single claim.'),
+                    code='invalid_response',
+                )
+            rows = groups[0]
+            movement_id = rows[0]['movement_id']
+            lease_token = rows[0]['lease_token']
+            try:
+                with self.env.cr.savepoint():
+                    picking = self._process_stock_movement_group(rows)
+                self.env.cr.commit()
+                result = {
+                    'movement_id': movement_id, 'worker': worker, 'lease_token': lease_token,
+                    'accepted': True, 'odoo_external_id': str(picking.id),
+                }
+            except Exception as exc:
+                _logger.exception('SoftLife stock movement group %s failed', movement_id)
+                result = {
+                    'movement_id': movement_id, 'worker': worker, 'lease_token': lease_token,
+                    'accepted': False, 'error': str(exc),
+                }
+                if self._stock_movement_error_is_retryable(exc):
+                    result['retry_at'] = (
+                        fields.Datetime.now()
+                        + datetime.timedelta(minutes=self._stock_movement_retry_minutes)
+                    ).isoformat() + 'Z'
+            self._api_request(
+                'POST', '/api/internal/odoo/stock-movements/result', payload=result,
+            )
+            processed += 1
+        return processed
 
     @api.model
     def sync_machines(self):
@@ -1699,6 +2044,10 @@ class SoftlifeSyncClient(models.TransientModel):
             self.process_platform_sync_request()
         except Exception as exc:
             _logger.warning('SoftLife sync request polling failed: %s', exc)
+        try:
+            self.process_platform_stock_movements()
+        except Exception as exc:
+            _logger.warning('SoftLife stock movement polling failed: %s', exc)
 
     @api.model
     def _cron_fiscal_configuration(self):

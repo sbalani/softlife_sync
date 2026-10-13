@@ -44,9 +44,10 @@ never silently re-pointed at something else.
 Warehouse lot stock is sent as a complete snapshot to
 `/api/internal/odoo/lot-stock-snapshot`. Rows are grouped from positive
 internal quants by Odoo lot and warehouse; global lot quantities are never
-assigned to a warehouse by inference. The connector sends
-`reflected_references: []` until it can prove movement references are present
-in the same Odoo state.
+assigned to a warehouse by inference. The connector captures external
+references from completed platform stock pickings before reading quantities
+and sends them as `reflected_references`, keeping concurrent snapshots
+conservative.
 
 Odoo **no longer talks to Huaxin directly**; `softlife_huaxin` is retired.
 
