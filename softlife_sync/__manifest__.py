@@ -1,6 +1,6 @@
 {
     'name': 'SoftLife Platform Sync',
-    'version': '18.0.10.0.0',
+    'version': '18.0.10.0.1',
     'summary': 'Synchronize SoftLife master data and manufacturing periods with Odoo.',
     'description': """
 SoftLife Platform Sync
@@ -23,8 +23,9 @@ system of record operated by the middleware) and mirrors into Odoo:
 Linking a platform ingredient to an Odoo SKU (products.odoo_id) is never done
 by this module automatically — it's a deliberate choice made on the platform
 (see /odoo and /products there). Records removed/archived in Odoo are pruned
-from the mirror tables on the next sync; any ingredient linked to a pruned
-row is automatically unlinked (FK is ON DELETE SET NULL), never re-pointed.
+from the mirror tables unless immutable recipe or production history still
+references that SKU identity. Ingredient links to pruned rows are cleared
+(FK is ON DELETE SET NULL), never re-pointed.
 
 Odoo no longer talks to Huaxin directly — the middleware owns Huaxin.
 Idempotent by immutable platform ids with SQL uniqueness in Odoo. Run via

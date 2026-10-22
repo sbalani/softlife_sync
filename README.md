@@ -37,10 +37,12 @@ silently created a duplicate Odoo product for an ingredient that already had
 a real match under a different id, and linked to the wrong one. Don't repeat
 that mistake if you touch this file again.
 
-Records deleted/archived in Odoo are pruned from the mirror tables on the
-next sync. If a platform ingredient was linked to a pruned record, the link
-is automatically cleared (`products.odoo_id` has `ON DELETE SET NULL`) — it's
-never silently re-pointed at something else.
+Records deleted/archived in Odoo are pruned from the mirror tables on the next
+sync unless immutable recipe or production history still references that SKU
+identity. Referenced SKU rows remain as historical identities. If a platform
+ingredient was linked to a safely pruned record, the link is automatically
+cleared (`products.odoo_id` has `ON DELETE SET NULL`) — it's never silently
+re-pointed at something else.
 
 Warehouse lot stock is sent as a complete snapshot to
 `/api/internal/odoo/lot-stock-snapshot`. Rows are grouped from positive

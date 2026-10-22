@@ -1912,10 +1912,14 @@ class SoftlifeSyncClient(models.TransientModel):
             raise UserError(_('Supabase upsert %s failed: %s %s') % (table, r.status_code, r.text[:200]))
 
     @api.model
-    def _rest_delete_missing(self, table, id_column, present_ids):
+    def _rest_delete_missing(self, table, id_column, present_ids, retain_referenced=False):
         """Delete rows from a Supabase table whose id_column isn't in present_ids —
         i.e. records removed/archived on the Odoo side since the last sync.
-        No-ops on an empty present_ids so a transient empty read can't wipe the table."""
+        No-ops on an empty present_ids so a transient empty read can't wipe the table.
+
+        Product identities frozen into immutable recipe versions must remain in the
+        mirror. For those rows, prune individually and retain only FK-blocked rows.
+        """
         import requests
         if not present_ids:
             return
@@ -1923,6 +1927,26 @@ class SoftlifeSyncClient(models.TransientModel):
         key = self._param('softlife.sync.supabase_key')
         url = f'{base}/rest/v1/{table}'
         headers = {'apikey': key, 'Authorization': f'Bearer {key}', 'Prefer': 'return=minimal'}
+        if retain_referenced:
+            mirrored = self._rest_get(table, {'select': id_column, 'limit': 10000})
+            present = set(present_ids)
+            missing = [row.get(id_column) for row in mirrored if row.get(id_column) not in present]
+            for missing_id in missing:
+                r = requests.delete(url, headers=headers, params={id_column: f'eq.{missing_id}'}, timeout=60)
+                if r.status_code in (200, 204):
+                    continue
+                try:
+                    error_code = r.json().get('code')
+                except (TypeError, ValueError):
+                    error_code = None
+                if r.status_code == 409 and error_code == '23503':
+                    _logger.info(
+                        'softlife_sync: retained historical %s row %s=%s because it is still referenced',
+                        table, id_column, missing_id,
+                    )
+                    continue
+                raise UserError(_('Supabase delete-missing %s failed: %s %s') % (table, r.status_code, r.text[:200]))
+            return
         ids_csv = ','.join(str(i) for i in present_ids)
         r = requests.delete(url, headers=headers, params={id_column: f'not.in.({ids_csv})'}, timeout=60)
         if r.status_code not in (200, 204):
@@ -2028,10 +2052,12 @@ class SoftlifeSyncClient(models.TransientModel):
                 'package_content_uom': p.package_content_uom or None,
             })
         self._rest_upsert('odoo_products', rows, on_conflict='odoo_id')
-        # Deleted/archived in Odoo -> drop from the mirror. Any platform ingredient
-        # linked to it (products.odoo_id) is auto-unlinked (FK is ON DELETE SET NULL),
-        # never silently re-pointed at something else.
-        self._rest_delete_missing('odoo_products', 'odoo_id', [r['odoo_id'] for r in rows])
+        # Delete archived products only when no immutable recipe or production
+        # record still depends on their historical Odoo identity.
+        self._rest_delete_missing(
+            'odoo_products', 'odoo_id', [r['odoo_id'] for r in rows],
+            retain_referenced=True,
+        )
         return len(rows)
 
     @api.model

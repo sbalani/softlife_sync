@@ -1,6 +1,6 @@
 import hashlib
 import json
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from odoo.tests.common import TransactionCase
 
@@ -66,6 +66,33 @@ class TestSyncRequests(TransactionCase):
         self.assertTrue(result['accepted'])
         self.assertIsNone(result['error'])
         self.assertEqual(result['summary'], summary)
+
+    def test_product_pruning_retains_historical_recipe_references(self):
+        Client = type(self.client)
+        deleted = Mock(status_code=204, text='')
+        referenced = Mock(status_code=409, text='foreign key violation')
+        referenced.json.return_value = {'code': '23503'}
+        with patch.object(Client, '_rest_get', return_value=[
+                {'odoo_id': 175}, {'odoo_id': 176}, {'odoo_id': 177},
+        ]), patch('requests.delete', side_effect=[referenced, deleted]) as delete:
+            self.client._rest_delete_missing(
+                'odoo_products', 'odoo_id', [175], retain_referenced=True,
+            )
+
+        self.assertEqual(delete.call_count, 2)
+        self.assertEqual(delete.call_args_list[0].kwargs['params'], {'odoo_id': 'eq.176'})
+        self.assertEqual(delete.call_args_list[1].kwargs['params'], {'odoo_id': 'eq.177'})
+
+    def test_product_pruning_does_not_hide_non_fk_failures(self):
+        Client = type(self.client)
+        failed = Mock(status_code=503, text='unavailable')
+        failed.json.return_value = {'code': 'PGRST000'}
+        with patch.object(Client, '_rest_get', return_value=[{'odoo_id': 176}]), \
+                patch('requests.delete', return_value=failed):
+            with self.assertRaisesRegex(Exception, 'delete-missing odoo_products failed'):
+                self.client._rest_delete_missing(
+                    'odoo_products', 'odoo_id', [175], retain_referenced=True,
+                )
 
     def test_dispatches_remediation_without_full_sync(self):
         Client = type(self.client)
