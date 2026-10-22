@@ -1,6 +1,6 @@
 {
     'name': 'SoftLife Platform Sync',
-    'version': '18.0.9.0.0',
+    'version': '18.0.10.0.0',
     'summary': 'Synchronize SoftLife master data and manufacturing periods with Odoo.',
     'description': """
 SoftLife Platform Sync
@@ -10,7 +10,7 @@ system of record operated by the middleware) and mirrors into Odoo:
 
   tenants        -> res.partner (customers)
   products       -> product.template
-  manufacturing periods -> MOs, warehouse sales orders and validated deliveries
+  manufacturing periods -> aggregate MOs, versioned sales orders and validated deliveries
 
 ...and mirrors Odoo's own SKU/lot/warehouse master data back out to Supabase
 (read-only mirror tables the platform consumes — see softlife-platform/README):

@@ -10,6 +10,11 @@
                     <group>
                         <field name="softlife_export_id" readonly="1"/>
                         <field name="softlife_warehouse_id" readonly="1"/>
+                        <field name="softlife_sale_key" readonly="1"/>
+                        <field name="softlife_source_order_id" readonly="1"/>
+                        <field name="softlife_source_payload_sha256" readonly="1"/>
+                        <field name="softlife_manufacturing_contract_version" readonly="1"/>
+                        <field name="softlife_document_date" readonly="1"/>
                     </group>
                     <field name="softlife_source_summary" readonly="1" nolabel="1"/>
                     <field name="softlife_source_orders" readonly="1" widget="json" nolabel="1"/>

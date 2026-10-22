@@ -13,7 +13,8 @@ warehouse sales documents.
 | `products` | `product.template` |
 | `machines` | `softlife.machine` (matched by IMEI; customer linked) |
 | ready manufacturing period | completed `mrp.production` per warehouse/recipe version |
-| ready manufacturing period | confirmed `sale.order` and validated delivery per warehouse |
+| August contract-v2 manufacturing period | confirmed `sale.order` and validated delivery per warehouse |
+| contract-v3 manufacturing period from 2026-09-01 | confirmed `sale.order` and validated delivery per source transaction |
 
 For SKUs, lots and warehouses, **Odoo is the system of record** instead — it
 already owns real stock/traceability data. This module mirrors that data back
@@ -74,9 +75,12 @@ runs, and retries callbacks. Generated records commit in one cron/action pass;
 the `/result` callback is attempted only in a later pass.
 
 Idempotency is enforced in PostgreSQL: one finished product per recipe, one BOM
-per recipe version, one MO per export/warehouse/version/currency, and one sales
-order per export/warehouse. Sales orders are confirmed and deliveries validated;
-this module never creates an invoice from a manufacturing period.
+per recipe version, and one MO per export/warehouse/version/currency. August
+contract-v2 runs retain one sales order per export/warehouse. Contract-v3 runs
+dated from September 1, 2026 keep those aggregate MOs but create one immutable
+sales order and delivery chain per frozen source UUID/hash. The v3 callback maps
+every source UUID to its exact Odoo sale, sale line, and all delivery IDs.
+Manufacturing itself never creates an invoice.
 
 Fiscal invoice batches preserve quantity for audited zero-value Free, Admin override,
 and Huaxin coupon (`串码支付`) vends. Other zero-total payment types remain blocked.
@@ -115,14 +119,54 @@ process-local authorization.
 Bulk confirmation resolves every invoice by both platform UUID and Odoo move ID,
 validates the complete batch, and posts only the explicitly listed drafts in one
 savepoint after locking them. Confirmation revalidates each persisted snapshot and
-current Odoo structure immediately before posting and again afterward. Exact
-retries of already posted invoices succeed. Unrelated drafts are never included.
+current Odoo structure immediately before posting and again afterward. Exact retries
+of already posted invoices succeed. Unrelated drafts are never included.
 Creation and confirmation remain disabled unless their respective settings are
 enabled, and enabling either requires an explicit fiscal company.
 
+Fiscal contract v2 binds every invoice line to one exact platform allocation and
+contract-v3 sales-order line. Customer-requested invoices carry the frozen legal
+name, tax ID, email, address, postal code, city, province, country, request ID,
+and fiscal-details hash. Odoo creates or reuses that partner by the immutable
+request identity and evaluates product tax/account mappings with that partner's
+effective fiscal position, including the valid case where no position applies. Its
+fiscal snapshot fields are frozen after provenance is assigned. The monthly
+consolidated invoice uses the configured final consumer. Unique allocation, source,
+and accounting keys prevent a changed
+platform invoice UUID from duplicating accounting. Fiscal contract v1 and its
+later sale-link operation remain available unchanged for August history and
+retries.
+
+The v2 payload has top-level `local_month` and no top-level customer. Each invoice
+uses `invoice_mode` (`individual_requested` or `monthly_consolidated`), an exact
+customer snapshot, `allocations`, and matching lines keyed by
+`platform_allocation_id`. Invoice and line `zero_value_reason` fields are canonical,
+and each allocation carries both its preflight `source_sha256` and the dedicated
+`supporting_sale_order_source_sha256`. Drafting and confirmation take a company/month
+advisory lock so manufacturing cannot concurrently add source sales. The platform
+preflight is authoritative for inclusion and intentionally excludes database-validated
+post-manufacturing refunds; Odoo therefore validates every included allocation and
+supporting sale exactly without requiring every monthly Odoo sale to appear. A request
+has hard limits of 500 invoices and 5,000 total lines. Contract-v3 manufacturing uses warehouse
+`sales_orders`; each carries `platform_order_id`, `platform_line_key`,
+`source_sha256`, `recipe_version_id`, order/customer/currency data, exact cents, and
+one nested line.
+Manufacturing does not infer or persist fiscal invoice mode. Recipe aggregates
+carry `units_sold`, `gross_sales`, and `gross_sales_cents`; integer cents reconcile
+exactly to the per-order rounded totals for that recipe version, and `gross_sales`
+must round to the same cents at the payload currency's rounding precision. Manufacturing
+contract v3 continues to use recipe `payload_contract_version` 2. Before validating
+or creating transaction sales, manufacturing takes the same company/month advisory
+lock as fiscal v2 using the run `document_date`; every transaction date must belong
+to that month. Connector-generated sales and their operational lines are frozen
+against ordinary edits while connector-authorized confirmation and delivery-derived
+computed updates remain available.
+
 Completed Huaxin Free, Admin override, and coupon (`串码支付`) vends are retained
 as zero-value customer invoices. Their product quantity remains on the invoice for
-the accounting trail. The invoice itself does not create or alter stock movements.
+the accounting trail. The connector advertises zero-value capability version 2 and
+requires the platform fiscal-v2 contract to require that same version. The invoice
+itself does not create or alter stock movements.
 
 ### Package content and recipe dosage
 

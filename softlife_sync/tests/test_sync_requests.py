@@ -132,6 +132,21 @@ class TestSyncRequests(TransactionCase):
         self.assertFalse(result['accepted'])
         create.assert_not_called()
 
+    def test_dispatches_source_bound_fiscal_contract_two_with_frozen_hash(self):
+        Client = type(self.client)
+        payload = {'contract_version': 2, 'invoices': []}
+        payload_hash = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(',', ':'),
+        ).encode()).hexdigest()
+        with patch.object(Client, '_create_fiscal_invoice_drafts', return_value={
+                'accepted': True, 'summary': 'source-bound', 'contract_version': 2}) as create:
+            result = self.client._dispatch_platform_sync_request({
+                'kind': 'fiscal_invoice_draft_creation',
+                'payload': payload, 'payload_sha256': payload_hash,
+            })
+        self.assertEqual(result['contract_version'], 2)
+        create.assert_called_once_with(payload)
+
     def test_dispatches_fiscal_sale_links_without_a_hash(self):
         Client = type(self.client)
         payload = {'contract_version': 1, 'local_month': '2026-07', 'links': []}

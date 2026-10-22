@@ -1,9 +1,16 @@
 import datetime
 import logging
+import math
+import re
+import uuid
+from decimal import Decimal, ROUND_HALF_UP
 
 from odoo import _, api, Command, fields, models
 from odoo.exceptions import UserError, ValidationError
 from odoo.tools.float_utils import float_compare
+
+from .manufacturing_documents import _softlife_manufacturing_internal_scope
+from .locks import softlife_company_month_advisory_lock
 
 _logger = logging.getLogger(__name__)
 
@@ -707,15 +714,396 @@ class SoftlifeManufacturingRun(models.Model):
         })]})
         return difference
 
+    @api.model
+    def _canonical_uuid(self, value, label):
+        try:
+            normalized = str(uuid.UUID(str(value)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValidationError(_('%s must be a canonical UUID.') % label) from exc
+        if normalized != value:
+            raise ValidationError(_('%s must be a canonical UUID.') % label)
+        return normalized
+
+    def _sales_order_values(self, warehouse_payload, recipe_products, currency):
+        self.ensure_one()
+        document_date = fields.Date.to_date(self.document_date)
+        if not document_date:
+            raise ValidationError(_('Manufacturing payload requires document_date.'))
+        document_month = document_date.strftime('%Y-%m')
+        sales_orders = warehouse_payload.get('sales_orders')
+        if not isinstance(sales_orders, list) or not sales_orders:
+            raise ValidationError(_('Manufacturing contract 3 requires frozen sales_orders.'))
+        seen_orders = set()
+        seen_lines = set()
+        totals = {}
+        result = []
+        source_rows = warehouse_payload.get('source_orders')
+        source_fields = {
+            'platform_order_id', 'order_code', 'machine_id', 'machine_imei', 'machine_name',
+        }
+        if not isinstance(source_rows, list) or any(
+                not isinstance(source, dict) or set(source) != source_fields
+                for source in source_rows):
+            raise ValidationError(_('Manufacturing contract 3 source_orders are invalid.'))
+        source_orders = {source['platform_order_id']: source for source in source_rows}
+        if len(source_orders) != len(source_rows):
+            raise ValidationError(_('Manufacturing contract 3 source_orders contain duplicates.'))
+        expected_order_fields = {
+            'platform_order_id', 'platform_line_key', 'source_sha256',
+            'recipe_version_id', 'order_code', 'order_date', 'customer_odoo_id',
+            'currency', 'reference',
+            'expected_total_cents', 'lines',
+        }
+        expected_line_fields = {
+            'platform_line_key', 'odoo_product_id', 'description', 'quantity', 'gross_cents',
+        }
+        for sales_order in sales_orders:
+            if not isinstance(sales_order, dict) or set(sales_order) != expected_order_fields:
+                raise ValidationError(_('Every frozen sales order must use the canonical fields.'))
+            source_id = self._canonical_uuid(
+                sales_order.get('platform_order_id'), 'platform_order_id',
+            )
+            if source_id in seen_orders:
+                raise ValidationError(_('Platform order %s appears more than once.') % source_id)
+            seen_orders.add(source_id)
+            recipe_version_id = self._canonical_uuid(
+                sales_order.get('recipe_version_id'), 'recipe_version_id',
+            )
+            payload_hash = sales_order.get('source_sha256')
+            if not isinstance(payload_hash, str) or not re.fullmatch(r'[0-9a-f]{64}', payload_hash):
+                raise ValidationError(_('Platform order %s has an invalid source hash.') % source_id)
+            platform_line_key = sales_order.get('platform_line_key')
+            lines = sales_order.get('lines')
+            if (
+                not isinstance(platform_line_key, str) or not platform_line_key.strip()
+                or platform_line_key != '%s:1' % source_id
+                or platform_line_key in seen_lines
+                or not isinstance(lines, list) or len(lines) != 1
+                or not isinstance(lines[0], dict) or set(lines[0]) != expected_line_fields
+                or lines[0].get('platform_line_key') != platform_line_key
+            ):
+                raise ValidationError(_('Platform order %s has invalid line identity.') % source_id)
+            seen_lines.add(platform_line_key)
+            line = lines[0]
+            product_id = line.get('odoo_product_id')
+            if not isinstance(product_id, int) or isinstance(product_id, bool) or product_id <= 0:
+                raise ValidationError(_('Platform order %s has an invalid product ID.') % source_id)
+            product = recipe_products.get(recipe_version_id)
+            if not product or product.id != product_id:
+                raise ValidationError(_(
+                    'Platform order %s does not match its recipe aggregate product.'
+                ) % source_id)
+            quantity = line.get('quantity')
+            gross_cents = line.get('gross_cents')
+            if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
+                raise ValidationError(_('Platform order %s quantity must be a positive integer.') % source_id)
+            if not isinstance(gross_cents, int) or isinstance(gross_cents, bool) or gross_cents < 0:
+                raise ValidationError(_('Platform order %s gross_cents must be nonnegative.') % source_id)
+            try:
+                order_date = datetime.date.fromisoformat(sales_order.get('order_date', '')).isoformat()
+            except (TypeError, ValueError):
+                order_date = False
+            if (
+                sales_order.get('currency') != currency.name
+                or sales_order.get('customer_odoo_id') != warehouse_payload.get('odoo_customer_id')
+                or not isinstance(sales_order.get('customer_odoo_id'), int)
+                or isinstance(sales_order.get('customer_odoo_id'), bool)
+                or sales_order['customer_odoo_id'] <= 0
+                or not isinstance(sales_order.get('order_code'), str) or not sales_order['order_code'].strip()
+                or not isinstance(sales_order.get('reference'), str) or not sales_order['reference'].strip()
+                or order_date != sales_order.get('order_date')
+                or not order_date
+                or order_date[:7] != document_month
+                or sales_order.get('expected_total_cents') != gross_cents
+                or not isinstance(line.get('description'), str) or not line['description'].strip()
+            ):
+                raise ValidationError(_('Platform order %s has an invalid header or total.') % source_id)
+            source = source_orders.get(source_id)
+            if not source:
+                raise ValidationError(_('Platform order %s has no frozen source-order reference.') % source_id)
+            result.append({
+                'source_id': source_id, 'payload_hash': payload_hash,
+                'platform_line_key': platform_line_key,
+                'recipe_version_id': recipe_version_id, 'product': product,
+                'quantity': quantity, 'gross_cents': gross_cents,
+                'order_code': sales_order['order_code'], 'order_date': order_date,
+                'reference': sales_order['reference'], 'description': line['description'],
+                'source': source,
+            })
+            current = totals.setdefault(recipe_version_id, [0, 0])
+            current[0] += quantity
+            current[1] += gross_cents
+        if seen_orders != set(source_orders):
+            raise ValidationError(_(
+                'Manufacturing contract 3 sales_orders must cover source_orders exactly.'
+            ))
+        return result, totals
+
+    def _validate_contract_three_sales(self, warehouses):
+        self.ensure_one()
+        payload_contract_version = (self.payload or {}).get('payload_contract_version')
+        if not isinstance(payload_contract_version, int) \
+                or isinstance(payload_contract_version, bool) \
+                or payload_contract_version != 2:
+            raise ValidationError(_(
+                'Manufacturing contract 3 requires payload_contract_version 2.'
+            ))
+        for warehouse_payload in warehouses:
+            if not isinstance(warehouse_payload, dict) or set(warehouse_payload) != {
+                    'odoo_warehouse_id', 'odoo_customer_id', 'source_orders',
+                    'sales_orders', 'recipes'}:
+                raise ValidationError(_('Manufacturing contract 3 warehouse fields are invalid.'))
+            groups = warehouse_payload.get('recipes') if isinstance(warehouse_payload, dict) else None
+            if not isinstance(groups, list) or not groups:
+                raise ValidationError(_('Manufacturing contract 3 requires recipe aggregates.'))
+            currencies = {group.get('currency') for group in groups if isinstance(group, dict)}
+            if len(currencies) != 1 or not next(iter(currencies), None):
+                raise ValidationError(_('Manufacturing contract 3 requires one warehouse currency.'))
+            currency = self.env['res.currency'].search([('name', '=', next(iter(currencies)))], limit=1)
+            if not currency:
+                raise ValidationError(_('Manufacturing contract 3 references an unknown currency.'))
+            recipe_products = {}
+            recipe_totals = {}
+            group_fields = {
+                'odoo_warehouse_id', 'odoo_customer_id', 'warehouse_name', 'recipe_id',
+                'recipe_version_id', 'version', 'name', 'odoo_finished_product_id',
+                'units_sold', 'gross_sales', 'gross_sales_cents', 'currency', 'components',
+            }
+            component_fields = {
+                'odoo_product_id', 'quantity_per_unit', 'total_quantity', 'uom',
+                'stock_quantity_per_unit', 'stock_total_quantity', 'stock_uom',
+                'package_content_quantity', 'package_content_uom',
+            }
+            for group in groups:
+                if not isinstance(group, dict) or set(group) != group_fields:
+                    raise ValidationError(_('Manufacturing contract 3 recipe aggregates must be objects.'))
+                if (
+                    group.get('odoo_warehouse_id') != warehouse_payload['odoo_warehouse_id']
+                    or group.get('odoo_customer_id') != warehouse_payload['odoo_customer_id']
+                ):
+                    raise ValidationError(_('Recipe aggregate warehouse identity is invalid.'))
+                product_id = group.get('odoo_finished_product_id')
+                quantity = group.get('units_sold')
+                gross = group.get('gross_sales')
+                gross_cents = group.get('gross_sales_cents')
+                if (
+                    not isinstance(product_id, int) or isinstance(product_id, bool) or product_id <= 0
+                    or not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0
+                    or not isinstance(gross, (int, float)) or isinstance(gross, bool)
+                    or not math.isfinite(gross) or gross < 0
+                    or not isinstance(gross_cents, int) or isinstance(gross_cents, bool)
+                    or gross_cents < 0
+                ):
+                    raise ValidationError(_('Manufacturing contract 3 has invalid recipe aggregates.'))
+                rounded_gross_cents = int(
+                    (Decimal(str(currency.round(gross))) * 100).quantize(
+                        Decimal('1'), rounding=ROUND_HALF_UP,
+                    )
+                )
+                if rounded_gross_cents != gross_cents:
+                    raise ValidationError(_(
+                        'Recipe gross_sales contradicts gross_sales_cents at currency rounding.'
+                    ))
+                product = self.env['product.product'].browse(product_id).exists()
+                if not product:
+                    raise ValidationError(_('Manufacturing contract 3 references an unknown product.'))
+                recipe = self._recipe_from_group(
+                    group, (self.payload or {}).get('payload_contract_version'),
+                )
+                if recipe.get('odoo_finished_product_id') != product_id:
+                    raise ValidationError(_('Recipe finished product does not match the frozen payload.'))
+                for component in group.get('components') or []:
+                    if not isinstance(component, dict) or set(component) != component_fields:
+                        raise ValidationError(_('Recipe components must be objects.'))
+                    dosage_per_unit = component.get('quantity_per_unit')
+                    dosage_total = component.get('total_quantity')
+                    stock_per_unit = component.get('stock_quantity_per_unit')
+                    stock_total = component.get('stock_total_quantity')
+                    if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                               and math.isfinite(value) and value > 0 for value in (
+                                   dosage_per_unit, dosage_total, stock_per_unit, stock_total)):
+                        raise ValidationError(_('Recipe component quantities are invalid.'))
+                    if (
+                        abs(dosage_total - dosage_per_unit * quantity)
+                        > max(1e-9, abs(dosage_per_unit * quantity) * 1e-8)
+                        or abs(stock_total - stock_per_unit * quantity)
+                        > max(1e-9, abs(stock_per_unit * quantity) * 1e-8)
+                    ):
+                        raise ValidationError(_('Recipe component totals do not match units_sold.'))
+                recipe_version_id = self._canonical_uuid(
+                    group.get('recipe_version_id'), 'recipe_version_id',
+                )
+                if recipe_version_id in recipe_products:
+                    raise ValidationError(_('Recipe aggregates contain duplicate versions.'))
+                recipe_products[recipe_version_id] = product
+                recipe_totals[recipe_version_id] = [quantity, gross_cents]
+            _sales, sales_totals = self._sales_order_values(
+                warehouse_payload, recipe_products, currency,
+            )
+            if sales_totals != recipe_totals:
+                raise ValidationError(_(
+                    'Frozen sales-order quantities or gross cents do not match the recipe aggregates.'
+                ))
+
+    def _lock_company_month(self, document_date):
+        self.ensure_one()
+        return softlife_company_month_advisory_lock(
+            self.env.cr, self.env.company.id, document_date,
+        )
+
+    def _process_transaction_sales(self, warehouse_payload, warehouse, customer, pricelist,
+                                   currency, recipe_products, recipe_totals, warehouse_mo_ids,
+                                   document_datetime):
+        self.ensure_one()
+        sales_orders, sales_order_totals = self._sales_order_values(
+            warehouse_payload, recipe_products, currency,
+        )
+        expected_totals = {
+            recipe_version_id: [
+                int(quantity), int(gross_cents),
+            ]
+            for recipe_version_id, (quantity, gross_cents) in recipe_totals.items()
+        }
+        if sales_order_totals != expected_totals:
+            raise ValidationError(_(
+                'Frozen transaction quantities or gross cents do not match the recipe aggregates.'
+            ))
+        transaction_results = []
+        for transaction in sales_orders:
+            product = transaction['product']
+            quantity = transaction['quantity']
+            expected_gross = currency.round(transaction['gross_cents'] / 100.0)
+            sale_key = 'transaction:%s' % transaction['source_id']
+            sale = self.env['sale.order'].search([
+                '|', ('softlife_sale_key', '=', sale_key),
+                ('softlife_source_order_id', '=', transaction['source_id']),
+            ], limit=1)
+            created = not sale
+            if not sale:
+                with _softlife_manufacturing_internal_scope():
+                    sale = self.env['sale.order'].create({
+                        'partner_id': customer.id, 'warehouse_id': warehouse.id,
+                        'pricelist_id': pricelist.id,
+                        'date_order': fields.Datetime.to_datetime(transaction['order_date']),
+                        'client_order_ref': transaction['reference'],
+                        'softlife_export_id': self.export_id,
+                        'softlife_warehouse_id': warehouse.id,
+                        'softlife_sale_key': sale_key,
+                        'softlife_source_order_id': transaction['source_id'],
+                        'softlife_source_payload_sha256': transaction['payload_hash'],
+                        'softlife_manufacturing_contract_version': 3,
+                        'softlife_document_date': transaction['order_date'],
+                        'softlife_source_orders': [transaction['source']],
+                        'order_line': [Command.create({
+                            'product_id': product.id, 'name': transaction['description'],
+                            'product_uom_qty': quantity, 'product_uom': product.uom_id.id,
+                            'price_unit': expected_gross / quantity,
+                            'tax_id': [Command.set([])],
+                            'softlife_platform_line_key': transaction['platform_line_key'],
+                        })],
+                    })
+                    self._add_sales_rounding_adjustment(sale, expected_gross, currency)
+                    sale.action_confirm()
+            main_lines = sale.order_line.filtered(
+                lambda line: not line.display_type and not line.softlife_rounding_adjustment)
+            if (
+                sale.softlife_sale_key != sale_key
+                or sale.softlife_source_order_id != transaction['source_id']
+                or sale.softlife_source_payload_sha256 != transaction['payload_hash']
+                or sale.softlife_export_id != self.export_id
+                or sale.softlife_warehouse_id != warehouse
+                or sale.softlife_manufacturing_contract_version != 3
+                or fields.Date.to_string(sale.softlife_document_date) != transaction['order_date']
+                or sale.partner_id != customer or sale.currency_id != currency
+                or sale.warehouse_id != warehouse
+                or sale.state not in ('sale', 'done')
+                or len(main_lines) != 1 or main_lines.product_id != product
+                or main_lines.softlife_platform_line_key != transaction['platform_line_key']
+                or float_compare(
+                    main_lines.product_uom_qty, quantity,
+                    precision_rounding=product.uom_id.rounding,
+                )
+                or float_compare(
+                    main_lines.price_unit, expected_gross / quantity,
+                    precision_rounding=currency.rounding,
+                )
+            ):
+                raise ValidationError(_(
+                    'Existing sales order for source transaction %s does not match the immutable payload.'
+                ) % transaction['source_id'])
+            if sale.softlife_source_orders != [transaction['source']]:
+                raise ValidationError(_('Existing sales order source provenance changed.'))
+            if sale.order_line.filtered(lambda line: not line.display_type and line.tax_id):
+                raise ValidationError(_('Existing transaction sales order has unexpected taxes.'))
+            adjustments = sale.order_line.filtered(
+                lambda line: not line.display_type and line.softlife_rounding_adjustment)
+            if len(adjustments) > 1 or adjustments and (
+                    adjustments.product_id.default_code != 'SOFTLIFE-ROUNDING'
+                    or adjustments.product_id.type != 'service'
+                    or float_compare(
+                        adjustments.product_uom_qty, 1.0,
+                        precision_rounding=adjustments.product_uom.rounding,
+                    )):
+                raise ValidationError(_('Existing transaction sales rounding adjustment is invalid.'))
+            if float_compare(sale.amount_total, expected_gross, precision_rounding=currency.rounding):
+                raise ValidationError(_('Existing transaction sales order total is not exact.'))
+            self._complete_sale_deliveries(sale, document_datetime)
+            if float_compare(
+                main_lines.qty_delivered, quantity,
+                precision_rounding=main_lines.product_uom.rounding,
+            ):
+                raise ValidationError(_('Transaction sales order was not fully delivered.'))
+            deliveries = sale.picking_ids.filtered(
+                lambda picking: picking.state == 'done'
+                and picking.picking_type_code == 'outgoing'
+                and picking.location_dest_id.usage == 'customer'
+            )
+            if not deliveries:
+                raise ValidationError(_('Transaction sales order has no completed delivery.'))
+            transaction_results.append({
+                'platform_order_id': transaction['source_id'],
+                'platform_line_key': transaction['platform_line_key'],
+                'source_sha256': transaction['payload_hash'],
+                'odoo_sale_order_id': sale.id,
+                'odoo_sale_order_line_id': main_lines.id,
+                'created': created,
+            })
+        return {
+            'odoo_warehouse_id': warehouse.id,
+            'manufacturing_order_ids': warehouse_mo_ids,
+            'sales_orders': transaction_results,
+        }
+
     def _process_documents(self):
         self.ensure_one()
         warehouses = (self.payload or {}).get('warehouses') or []
         if not warehouses:
             raise ValidationError(_('Ready run has no warehouse payload.'))
-        if int((self.payload or {}).get('manufacturing_contract_version') or 0) != 2:
+        contract_version = int((self.payload or {}).get('manufacturing_contract_version') or 0)
+        if contract_version not in (2, 3):
             raise ValidationError(_(
-                'Manufacturing payload must use contract version 2 with generic customer and source references.'
+                'Manufacturing payload must use contract version 2 or 3.'
             ))
+        cutover = fields.Date.to_date('2026-09-01')
+        document_date = fields.Date.to_date(self.document_date)
+        if not document_date:
+            raise ValidationError(_('Manufacturing payload requires document_date.'))
+        if (contract_version == 2 and document_date >= cutover) \
+                or (contract_version == 3 and document_date < cutover):
+            raise ValidationError(_(
+                'Manufacturing contract 2 is reserved for pre-September legacy runs; '
+                'contract 3 is required from 2026-09-01.'
+            ))
+        if contract_version == 3:
+            payload_contract_version = (self.payload or {}).get('payload_contract_version')
+            if not isinstance(payload_contract_version, int) \
+                    or isinstance(payload_contract_version, bool) \
+                    or payload_contract_version != 2:
+                raise ValidationError(_(
+                    'Manufacturing contract 3 requires payload_contract_version 2.'
+                ))
+            self._lock_company_month(document_date)
+            self._validate_contract_three_sales(warehouses)
         customer = self._manufacturing_customer()
         warehouse_results = []
         document_datetime = fields.Datetime.to_datetime(self.document_date)
@@ -728,6 +1116,11 @@ class SoftlifeManufacturingRun(models.Model):
                 raise ValidationError(_(
                     'Warehouse %(warehouse)s belongs to %(company)s; run this process in that Odoo company.',
                     warehouse=warehouse.display_name, company=warehouse.company_id.display_name,
+                ))
+            if contract_version == 3 and warehouse_payload.get('odoo_customer_id') != customer.id:
+                raise ValidationError(_(
+                    'Warehouse %(warehouse)s customer does not match the configured vending customer.',
+                    warehouse=warehouse.display_name,
                 ))
             if not warehouse.manu_type_id or not warehouse.lot_stock_id:
                 raise ValidationError(_('Warehouse %s is not configured for manufacturing.') % warehouse.display_name)
@@ -748,12 +1141,27 @@ class SoftlifeManufacturingRun(models.Model):
                     currency=currency.name, customer=customer.display_name,
                 ))
             sale_totals = {}
+            recipe_products = {}
+            recipe_totals = {}
             warehouse_mo_ids = []
             for group in groups:
                 quantity = float(group.get('units_sold') or 0)
                 gross = float(group.get('gross_sales') or 0)
                 if quantity <= 0 or gross < 0:
                     raise ValidationError(_('Invalid platform quantities for recipe %s.') % group.get('recipe_version_id'))
+                gross_cents = group.get('gross_sales_cents') if contract_version == 3 else int(
+                    (Decimal(str(gross)) * 100).quantize(
+                        Decimal('1'), rounding=ROUND_HALF_UP,
+                    )
+                )
+                if contract_version == 3 and (
+                    not quantity.is_integer()
+                    or not isinstance(gross_cents, int) or isinstance(gross_cents, bool)
+                    or gross_cents < 0
+                ):
+                    raise ValidationError(_(
+                        'Contract 3 recipe %s requires integer units_sold and gross_sales_cents aggregates.'
+                    ) % group.get('recipe_version_id'))
                 for component in group.get('components') or []:
                     dosage_per_unit = float(component.get('quantity_per_unit') or 0)
                     dosage_total = float(component.get('total_quantity') or 0)
@@ -800,9 +1208,23 @@ class SoftlifeManufacturingRun(models.Model):
                         or float_compare(mo.product_qty, quantity, precision_rounding=mo.product_uom_id.rounding):
                     raise ValidationError(_('Existing manufacturing order does not match the immutable payload.'))
                 warehouse_mo_ids.append(mo.id)
+                payload_product_id = group.get('odoo_finished_product_id')
+                if contract_version == 3 and recipe_sync.product_id.id != payload_product_id:
+                    raise ValidationError(_('Recipe finished product does not match the frozen payload.'))
+                recipe_products[recipe_sync.recipe_version_id] = recipe_sync.product_id
+                recipe_totals[recipe_sync.recipe_version_id] = [
+                    quantity,
+                    gross_cents if contract_version == 3 else int(currency.round(gross) * 100),
+                ]
                 totals = sale_totals.setdefault(recipe_sync.product_id, [0.0, 0.0])
                 totals[0] += quantity
                 totals[1] += gross
+            if contract_version == 3:
+                warehouse_results.append(self._process_transaction_sales(
+                    warehouse_payload, warehouse, customer, pricelist, currency,
+                    recipe_products, recipe_totals, warehouse_mo_ids, document_datetime,
+                ))
+                continue
             order_lines = [(0, 0, {
                 'product_id': product.id, 'product_uom_qty': totals[0],
                 'product_uom': product.uom_id.id, 'price_unit': totals[1] / totals[0],
@@ -817,18 +1239,22 @@ class SoftlifeManufacturingRun(models.Model):
                 ('softlife_warehouse_id', '=', warehouse.id),
             ], limit=1)
             if not sale:
-                sale = self.env['sale.order'].create({
-                    'partner_id': customer.id, 'warehouse_id': warehouse.id,
-                    'pricelist_id': pricelist.id,
-                    'date_order': document_datetime,
-                    'client_order_ref': self.export_id,
-                    'softlife_export_id': self.export_id,
-                    'softlife_warehouse_id': warehouse.id,
-                    'softlife_source_orders': source_orders,
-                    'order_line': order_lines,
-                })
-                self._add_sales_rounding_adjustment(sale, expected_gross, currency)
-                sale.action_confirm()
+                with _softlife_manufacturing_internal_scope():
+                    sale = self.env['sale.order'].create({
+                        'partner_id': customer.id, 'warehouse_id': warehouse.id,
+                        'pricelist_id': pricelist.id,
+                        'date_order': document_datetime,
+                        'client_order_ref': self.export_id,
+                        'softlife_export_id': self.export_id,
+                        'softlife_warehouse_id': warehouse.id,
+                        'softlife_sale_key': 'legacy:%s:%s' % (self.export_id, warehouse.id),
+                        'softlife_manufacturing_contract_version': 2,
+                        'softlife_document_date': self.document_date,
+                        'softlife_source_orders': source_orders,
+                        'order_line': order_lines,
+                    })
+                    self._add_sales_rounding_adjustment(sale, expected_gross, currency)
+                    sale.action_confirm()
                 self._complete_sale_deliveries(sale, document_datetime)
             elif sale.state not in ('sale', 'done') or sale.currency_id != currency \
                     or sale.partner_id != customer or sale.warehouse_id != warehouse:

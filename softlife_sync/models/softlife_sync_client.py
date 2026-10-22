@@ -12,12 +12,15 @@ import uuid
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 from odoo import Command, _, api, fields, models
 from odoo.exceptions import UserError
 from odoo.tools.float_utils import float_compare
 
 from .account_move import _softlife_fiscal_internal_scope
+from .locks import softlife_company_month_advisory_lock
+from .res_partner import _softlife_fiscal_partner_internal_scope
 
 _logger = logging.getLogger(__name__)
 
@@ -188,12 +191,7 @@ class SoftlifeSyncClient(models.TransientModel):
 
         return {
             'contract_version': 1,
-            'capabilities': {
-                'fiscal_product_remediation': 1,
-                'fiscal_invoice_draft_creation': 1,
-                'fiscal_invoice_bulk_confirmation': 1,
-                'fiscal_zero_value_invoices': 2,
-            },
+            'capabilities': self._fiscal_capabilities(),
             'checked_at': fields.Datetime.now().isoformat() + 'Z',
             'company': {
                 'odoo_id': company.id,
@@ -227,6 +225,34 @@ class SoftlifeSyncClient(models.TransientModel):
             },
             'products': product_rows,
         }
+
+    @api.model
+    def _fiscal_capabilities(self):
+        return {
+            'fiscal_product_remediation': 1,
+            'fiscal_invoice_draft_creation': 1,
+            'fiscal_invoice_bulk_confirmation': 1,
+            'fiscal_zero_value_invoices': 2,
+            'manufacturing_transaction_sales': 1,
+            'fiscal_invoice_allocation_v2': 1,
+        }
+
+    @api.model
+    def _require_fiscal_v2_zero_value_capability(self, contract):
+        required = contract.get('required_capabilities') if isinstance(contract, dict) else None
+        required_version = required.get('fiscal_zero_value_invoices') \
+            if isinstance(required, dict) else None
+        advertised_version = self._fiscal_capabilities()['fiscal_zero_value_invoices']
+        if (
+            not isinstance(required, dict)
+            or not isinstance(required_version, int) or isinstance(required_version, bool)
+            or required_version != 2
+            or not isinstance(advertised_version, int) or isinstance(advertised_version, bool)
+            or advertised_version != 2
+        ):
+            self._fiscal_invoice_error(_(
+                'Fiscal contract v2 requires zero-value capability version 2.'
+            ))
 
     @api.model
     def _fiscal_company(self):
@@ -657,7 +683,519 @@ class SoftlifeSyncClient(models.TransientModel):
         return float(Decimal(cents) / Decimal(100) / Decimal(line['quantity']))
 
     @api.model
+    def _canonical_uuid(self, value):
+        try:
+            normalized = str(uuid.UUID(value)) if isinstance(value, str) else ''
+        except (ValueError, AttributeError):
+            normalized = ''
+        return normalized if normalized == value else False
+
+    @api.model
+    def _prepare_fiscal_v2_customer(self, customer, generic_customer, company):
+        if not isinstance(customer, dict):
+            self._fiscal_invoice_error(_('Fiscal invoice customer snapshot is invalid.'))
+        if set(customer) == {'odoo_id'}:
+            if customer['odoo_id'] != generic_customer.id:
+                self._fiscal_invoice_error(_('Generic fiscal customer does not match the current contract.'))
+            return {'partner': generic_customer, 'values': None, 'request_id': None}
+        detail_fields = {
+            'legal_name', 'tax_id', 'email', 'address', 'postal_code', 'city',
+            'province', 'country_code',
+        }
+        expected = detail_fields | {'request_id', 'fiscal_details_sha256'}
+        if set(customer) != expected or not self._canonical_uuid(customer.get('request_id')):
+            self._fiscal_invoice_error(_('Named fiscal customer snapshot fields are invalid.'))
+        if any(not isinstance(customer[field], str) or not customer[field].strip()
+               for field in detail_fields):
+            self._fiscal_invoice_error(_('Named fiscal customer snapshot values are invalid.'))
+        if (
+            not re.fullmatch(r'[0-9a-f]{64}', customer['fiscal_details_sha256'])
+            or self._canonical_sha256({field: customer[field] for field in detail_fields})
+            != customer['fiscal_details_sha256']
+            or not re.fullmatch(r'[A-Z]{2}', customer['country_code'])
+            or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', customer['email'])
+        ):
+            self._fiscal_invoice_error(_('Named fiscal customer snapshot hash is invalid.'))
+        limits = {
+            'legal_name': 200, 'tax_id': 50, 'email': 254, 'address': 300,
+            'postal_code': 20, 'city': 100, 'province': 100, 'country_code': 2,
+        }
+        for field_name, maximum in limits.items():
+            if len(customer[field_name]) > maximum:
+                self._fiscal_invoice_error(_('Named fiscal customer snapshot values are invalid.'))
+        country = self.env['res.country'].sudo().search([
+            ('code', '=', customer['country_code']),
+        ], limit=1)
+        if not country:
+            self._fiscal_invoice_error(_('Named fiscal customer country does not exist in Odoo.'))
+        state = self.env['res.country.state'].sudo().search([
+            ('country_id', '=', country.id), '|',
+            ('name', '=ilike', customer['province']), ('code', '=ilike', customer['province']),
+        ], limit=1)
+        if not state:
+            self._fiscal_invoice_error(_('Named fiscal customer province does not exist in Odoo.'))
+        partner = self.env['res.partner'].sudo().with_context(active_test=False).search([
+            ('softlife_fiscal_customer_id', '=', customer['request_id']),
+        ], limit=1)
+        values = {
+            'name': customer['legal_name'], 'vat': customer['tax_id'],
+            'email': customer['email'], 'street': customer['address'],
+            'city': customer['city'], 'zip': customer['postal_code'],
+            'state_id': state.id, 'country_id': country.id, 'company_id': company.id,
+            'customer_rank': 1,
+            'softlife_fiscal_customer_id': customer['request_id'],
+            'softlife_fiscal_customer_sha256': customer['fiscal_details_sha256'],
+        }
+        if partner and (
+            not partner.active or partner.company_id not in (company, self.env['res.company'])
+            or partner.softlife_fiscal_customer_sha256 != customer['fiscal_details_sha256']
+            or partner.name != values['name'] or (partner.vat or False) != values['vat']
+            or (partner.email or False) != values['email']
+            or (partner.street or False) != values['street']
+            or (partner.city or False) != values['city'] or (partner.zip or False) != values['zip']
+            or partner.country_id.id != values['country_id']
+            or partner.state_id.id != values['state_id']
+            or partner.company_id.id != values['company_id']
+            or partner.softlife_fiscal_customer_id != values['softlife_fiscal_customer_id']
+        ):
+            self._fiscal_invoice_error(_('Existing named fiscal customer does not match its frozen snapshot.'))
+        return {'partner': partner, 'values': values, 'request_id': customer['request_id']}
+
+    @api.model
+    def _validate_fiscal_v2_supporting_sale(self, invoice, line, allocation, company,
+                                            sale=None, sale_line=None, allowed_move=None):
+        sale = sale or self.env['sale.order'].sudo().browse(
+            allocation['odoo_sale_order_id']
+        ).exists()
+        sale_line = sale_line or self.env['sale.order.line'].sudo().browse(
+            allocation['odoo_sale_order_line_id']
+        ).exists()
+        main_lines = sale and sale.order_line.filtered(
+            lambda row: not row.display_type and not row.softlife_rounding_adjustment)
+        other_invoice_lines = sale_line and sale_line.invoice_lines.filtered(
+            lambda row: row.move_id.state != 'cancel' and row.move_id != allowed_move)
+        expected_price = float(
+            Decimal(line['gross_cents']) / Decimal(100) / Decimal(line['quantity'])
+        )
+        if (
+            not sale or not sale_line or sale_line.order_id != sale
+            or len(main_lines) != 1 or main_lines != sale_line
+            or sale_line.product_id.id != line['odoo_product_id']
+            or sale_line.name != line['description']
+            or sale_line.tax_id
+            or sale.company_id != company or sale.currency_id != company.currency_id
+            or not sale.warehouse_id or sale.warehouse_id != sale.softlife_warehouse_id
+            or sale.state not in ('sale', 'done')
+            or sale.softlife_manufacturing_contract_version != 3
+            or sale.softlife_source_order_id != allocation['source_order_id']
+            or sale.softlife_source_payload_sha256
+            != allocation['supporting_sale_order_source_sha256']
+            or not sale_line.softlife_platform_line_key
+            or not sale.softlife_document_date
+            or fields.Date.to_string(sale.softlife_document_date)[:7] != invoice['local_month']
+            or float_compare(
+                sale_line.product_uom_qty, line['quantity'],
+                precision_rounding=sale_line.product_uom.rounding,
+            )
+            or float_compare(
+                sale_line.qty_delivered, line['quantity'],
+                precision_rounding=sale_line.product_uom.rounding,
+            )
+            or abs(sale_line.price_unit - expected_price) > 1e-9
+            or self._amount_cents(sale_line.price_total) != line['gross_cents']
+            or self._amount_cents(sale.amount_total) != line['gross_cents']
+            or other_invoice_lines
+        ):
+            self._fiscal_invoice_error(_('Fiscal invoice source sales order does not match.'))
+        return sale_line
+
+    @api.model
+    def _validate_fiscal_v2_included_sales(self, company, local_month, source_ids, sale_ids):
+        included_sales = self.env['sale.order'].sudo().browse(sorted(sale_ids)).exists()
+        if included_sales:
+            self.env.cr.execute(
+                'SELECT id FROM sale_order WHERE id IN %s ORDER BY id FOR UPDATE',
+                [tuple(included_sales.ids)],
+            )
+            included_sales.invalidate_recordset()
+        included_sources = included_sales.mapped('softlife_source_order_id')
+        if (
+            len(included_sources) != len(set(included_sources))
+            or set(included_sources) != set(source_ids)
+            or set(included_sales.ids) != set(sale_ids)
+            or any(
+                sale.company_id != company
+                or sale.softlife_manufacturing_contract_version != 3
+                or sale.state not in ('sale', 'done')
+                or not sale.softlife_document_date
+                or fields.Date.to_string(sale.softlife_document_date)[:7] != local_month
+                for sale in included_sales
+            )
+        ):
+            self._fiscal_invoice_error(_(
+                'Fiscal v2 included allocations do not match their supporting source sales.'
+            ))
+        return included_sales
+
+    @api.model
+    def _validate_fiscal_invoice_draft_payload_v2(self, payload, contract):
+        if not isinstance(payload, dict) or set(payload) != {
+                'contract_version', 'configuration_report_id', 'configuration_payload_sha256',
+                'company', 'journal', 'tax', 'local_month', 'invoices'}:
+            self._fiscal_invoice_error(_('Fiscal invoice draft payload fields are invalid.'))
+        if payload.get('contract_version') != 2 or isinstance(payload.get('contract_version'), bool):
+            self._fiscal_invoice_error(_('Fiscal invoice draft contract version is unsupported.'))
+        self._require_fiscal_v2_zero_value_capability(contract)
+        if (
+            not isinstance(payload.get('configuration_report_id'), str)
+            or not payload['configuration_report_id'].strip()
+            or not isinstance(payload.get('configuration_payload_sha256'), str)
+            or not re.fullmatch(r'[0-9a-f]{64}', payload['configuration_payload_sha256'])
+        ):
+            self._fiscal_invoice_error(_('Fiscal invoice configuration report identity is invalid.'))
+        configuration = self._current_fiscal_invoice_configuration(contract)
+        company, journal, generic_customer, expected_rate = configuration
+        if payload.get('company') != {'odoo_id': company.id, 'country_code': 'ES', 'currency': 'EUR'} \
+                or payload.get('journal') != {'code': journal.code}:
+            self._fiscal_invoice_error(_('Fiscal invoice configuration does not match Odoo.'))
+        if not isinstance(payload.get('local_month'), str) or not re.fullmatch(
+                r'\d{4}-(0[1-9]|1[0-2])', payload['local_month']) \
+                or payload['local_month'] < '2026-09':
+            self._fiscal_invoice_error(_('Fiscal invoice month is invalid.'))
+        month_start = datetime.date.fromisoformat(payload['local_month'] + '-01')
+        month_end = (month_start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+        madrid_today = datetime.datetime.now(
+            datetime.timezone.utc,
+        ).astimezone(ZoneInfo('Europe/Madrid')).date()
+        if month_end > madrid_today:
+            self._fiscal_invoice_error(_('Fiscal invoice month must be closed.'))
+        softlife_company_month_advisory_lock(self.env.cr, company.id, month_start)
+        tax = self._validate_fiscal_invoice_tax(payload.get('tax'), company, expected_rate)
+        invoices = payload.get('invoices')
+        if not isinstance(invoices, list) or not 1 <= len(invoices) <= 500:
+            self._fiscal_invoice_error(_('Fiscal invoice draft requires 1 to 500 invoices.'))
+        payload = copy.deepcopy(payload)
+        seen_invoice_ids = set()
+        seen_sources = set()
+        seen_allocations = set()
+        seen_supporting_sales = set()
+        accounting_scopes = set()
+        named_customer_hashes = {}
+        product_ids = set()
+        sale_ids = set()
+        sale_line_ids = set()
+        total_line_count = 0
+        for invoice in payload['invoices']:
+            required = {
+                'platform_invoice_id', 'invoice_payload_sha256', 'move_type', 'invoice_date',
+                'currency', 'reference', 'expected_total_cents', 'invoice_mode',
+                'local_month', 'customer', 'zero_value_reason', 'allocations', 'lines',
+            }
+            if not isinstance(invoice, dict) or set(invoice) != required:
+                self._fiscal_invoice_error(_('Fiscal invoice fields are invalid.'))
+            invoice_id = invoice.get('platform_invoice_id')
+            frozen = copy.deepcopy(invoice)
+            invoice_hash = frozen.pop('invoice_payload_sha256', None)
+            try:
+                valid_date = datetime.date.fromisoformat(invoice.get('invoice_date', '')).isoformat()
+            except (TypeError, ValueError):
+                valid_date = False
+            if (
+                not self._canonical_uuid(invoice_id) or invoice_id in seen_invoice_ids
+                or not isinstance(invoice_hash, str) or not re.fullmatch(r'[0-9a-f]{64}', invoice_hash)
+                or self._canonical_sha256(frozen) != invoice_hash
+                or invoice.get('move_type') != 'out_invoice' or invoice.get('currency') != 'EUR'
+                or not isinstance(invoice.get('reference'), str) or not invoice['reference'].strip()
+                or not self._nonnegative_int(invoice.get('expected_total_cents'))
+                or valid_date != invoice.get('invoice_date')
+                or not isinstance(invoice.get('local_month'), str)
+                or invoice['local_month'] != payload['local_month']
+                or not invoice['invoice_date'].startswith(invoice['local_month'] + '-')
+                or invoice.get('invoice_mode') not in (
+                    'individual_requested', 'monthly_consolidated')
+            ):
+                self._fiscal_invoice_error(_('Fiscal invoice identity or header is invalid.'))
+            customer_info = self._prepare_fiscal_v2_customer(
+                invoice.get('customer'), generic_customer, company,
+            )
+            if invoice['invoice_mode'] == 'individual_requested' and not customer_info['request_id']:
+                self._fiscal_invoice_error(_('Individual fiscal invoices require a named customer snapshot.'))
+            if invoice['invoice_mode'] == 'monthly_consolidated' and customer_info['request_id']:
+                self._fiscal_invoice_error(_('The consolidated fiscal invoice must use the generic customer.'))
+            named_customer_id = customer_info['request_id']
+            if named_customer_id:
+                prior_hash = named_customer_hashes.setdefault(
+                    named_customer_id, invoice['customer']['fiscal_details_sha256'],
+                )
+                if prior_hash != invoice['customer']['fiscal_details_sha256']:
+                    self._fiscal_invoice_error(_(
+                        'One named fiscal customer ID has conflicting snapshots.'
+                    ))
+            allocations = invoice.get('allocations')
+            lines = invoice.get('lines')
+            if (
+                not isinstance(allocations, list) or not isinstance(lines, list)
+                or not allocations or len(allocations) != len(lines)
+                or invoice['invoice_mode'] == 'individual_requested' and len(lines) != 1
+            ):
+                self._fiscal_invoice_error(_('Fiscal invoice has an invalid source-line count.'))
+            total_line_count += len(lines)
+            if total_line_count > 5000:
+                self._fiscal_invoice_error(_('Fiscal invoice request cannot contain more than 5000 lines.'))
+            allocations_by_id = {}
+            for index, allocation in enumerate(allocations, start=1):
+                if not isinstance(allocation, dict) or set(allocation) != {
+                        'platform_allocation_id', 'preflight_item_id', 'source_order_id',
+                        'source_sha256', 'supporting_sale_order_source_sha256',
+                        'invoice_request_id', 'supporting_sale_order_id',
+                        'odoo_sale_order_id', 'odoo_sale_order_line_id', 'line_sequence'}:
+                    self._fiscal_invoice_error(_('Fiscal invoice allocation fields are invalid.'))
+                allocation_id = allocation.get('platform_allocation_id')
+                source_id = allocation.get('source_order_id')
+                request_id = allocation.get('invoice_request_id')
+                supporting_sale_id = allocation.get('supporting_sale_order_id')
+                if (
+                    not self._canonical_uuid(allocation_id) or allocation_id in seen_allocations
+                    or not self._canonical_uuid(allocation.get('preflight_item_id'))
+                    or not self._canonical_uuid(source_id) or source_id in seen_sources
+                    or not re.fullmatch(r'[0-9a-f]{64}', str(allocation.get('source_sha256') or ''))
+                    or not re.fullmatch(
+                        r'[0-9a-f]{64}',
+                        str(allocation.get('supporting_sale_order_source_sha256') or ''),
+                    )
+                    or not self._canonical_uuid(supporting_sale_id)
+                    or supporting_sale_id in seen_supporting_sales
+                    or not self._positive_int(allocation.get('odoo_sale_order_id'))
+                    or not self._positive_int(allocation.get('odoo_sale_order_line_id'))
+                    or not self._positive_int(allocation.get('line_sequence'))
+                    or allocation['line_sequence'] != index
+                    or request_id != customer_info['request_id']
+                ):
+                    self._fiscal_invoice_error(_('Fiscal invoice allocation identity is invalid.'))
+                allocations_by_id[allocation_id] = allocation
+                seen_allocations.add(allocation_id)
+                seen_sources.add(source_id)
+                seen_supporting_sales.add(supporting_sale_id)
+                sale_ids.add(allocation['odoo_sale_order_id'])
+                sale_line_ids.add(allocation['odoo_sale_order_line_id'])
+            gross_total = 0
+            for index, line in enumerate(lines, start=1):
+                if not isinstance(line, dict) or set(line) != {
+                        'platform_allocation_id', 'odoo_product_id', 'description', 'quantity',
+                        'gross_cents', 'tax_base_cents', 'vat_cents', 'zero_value_reason',
+                        'odoo_tax_id',
+                        'odoo_sale_order_id', 'odoo_sale_order_line_id'}:
+                    self._fiscal_invoice_error(_('Fiscal invoice line fields are invalid.'))
+                allocation = allocations_by_id.get(line.get('platform_allocation_id'))
+                if (
+                    not allocation or allocation['line_sequence'] != index
+                    or not self._positive_int(line.get('odoo_product_id'))
+                    or not isinstance(line.get('description'), str) or not line['description'].strip()
+                    or not self._positive_int(line.get('quantity'))
+                    or not self._nonnegative_int(line.get('gross_cents'))
+                    or not self._nonnegative_int(line.get('tax_base_cents'))
+                    or not self._nonnegative_int(line.get('vat_cents'))
+                    or line.get('odoo_tax_id') != tax.id
+                    or line['gross_cents'] != line['tax_base_cents'] + line['vat_cents']
+                    or line.get('zero_value_reason') not in (
+                        None, 'free', 'admin_override', 'coupon')
+                    or (line['gross_cents'] == 0) != (
+                        line['zero_value_reason'] is not None)
+                    or line.get('odoo_sale_order_id') != allocation['odoo_sale_order_id']
+                    or line.get('odoo_sale_order_line_id') != allocation['odoo_sale_order_line_id']
+                ):
+                    self._fiscal_invoice_error(_('Fiscal invoice line values are invalid.'))
+                rate = Decimal(str(tax.amount)) / Decimal(100)
+                computed_base = (Decimal(line['gross_cents']) / (Decimal(1) + rate)).quantize(
+                    Decimal('1'), rounding=ROUND_HALF_UP,
+                ) if tax.price_include else Decimal(line['tax_base_cents'])
+                computed_vat = Decimal(line['gross_cents']) - computed_base if tax.price_include else \
+                    (computed_base * rate).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+                if computed_vat != line['vat_cents']:
+                    self._fiscal_invoice_error(_('Fiscal invoice line VAT cents are invalid.'))
+                product_ids.add(line['odoo_product_id'])
+                gross_total += line['gross_cents']
+            if gross_total != invoice['expected_total_cents']:
+                self._fiscal_invoice_error(_('Fiscal invoice line cents do not match its expected total.'))
+            invoice_zero_reason = invoice.get('zero_value_reason')
+            if invoice_zero_reason not in (None, 'free', 'admin_override', 'coupon'):
+                self._fiscal_invoice_error(_('Fiscal invoice zero-value reason is invalid.'))
+            if invoice['invoice_mode'] == 'individual_requested':
+                if (
+                    invoice_zero_reason != lines[0]['zero_value_reason']
+                    or (invoice['expected_total_cents'] == 0)
+                    != (invoice_zero_reason is not None)
+                ):
+                    self._fiscal_invoice_error(_('Individual invoice zero-value reason is invalid.'))
+            elif invoice_zero_reason is not None:
+                self._fiscal_invoice_error(_(
+                    'The monthly consolidated invoice cannot have a header zero-value reason.'
+                ))
+            accounting_key = 'individual:%s' % customer_info['request_id'] \
+                if invoice['invoice_mode'] == 'individual_requested' else \
+                'consolidated:%s:%s' % (company.id, invoice['local_month'])
+            if accounting_key in accounting_scopes:
+                self._fiscal_invoice_error(_('Fiscal invoice accounting scope appears more than once.'))
+            accounting_scopes.add(accounting_key)
+            invoice['_customer_info'] = customer_info
+            invoice['_accounting_key'] = accounting_key
+            seen_invoice_ids.add(invoice_id)
+
+        included_sales = self._validate_fiscal_v2_included_sales(
+            company, payload['local_month'], seen_sources, sale_ids,
+        )
+
+        products = self.env['product.product'].sudo().with_company(company).with_context(
+            active_test=False,
+        ).browse(list(product_ids)).exists()
+        products_by_id = {product.id: product for product in products}
+        sales = included_sales
+        sales_by_id = {sale.id: sale for sale in sales}
+        sale_lines = self.env['sale.order.line'].sudo().browse(list(sale_line_ids)).exists()
+        sale_lines_by_id = {line.id: line for line in sale_lines}
+        if (
+            len(products_by_id) != len(product_ids) or len(sales_by_id) != len(sale_ids)
+            or len(sale_lines_by_id) != len(sale_line_ids)
+        ):
+            self._fiscal_invoice_error(_('Fiscal invoice references an unknown product or source sale.'))
+        existing_moves = self.env['account.move'].sudo().with_context(active_test=False).search([
+            '|', ('softlife_fiscal_invoice_id', 'in', list(seen_invoice_ids)),
+            ('softlife_fiscal_accounting_key', 'in', [
+                invoice['_accounting_key'] for invoice in payload['invoices']
+            ]),
+        ])
+        if existing_moves:
+            self.env.cr.execute(
+                'SELECT id FROM account_move WHERE id IN %s FOR UPDATE', [tuple(existing_moves.ids)],
+            )
+            existing_moves.invalidate_recordset()
+        existing_by_invoice = {move.softlife_fiscal_invoice_id: move for move in existing_moves}
+        existing_source_lines = self.env['account.move.line'].sudo().search([
+            '|', ('softlife_fiscal_source_order_id', 'in', list(seen_sources)),
+            ('softlife_fiscal_allocation_id', 'in', list(seen_allocations)),
+        ])
+        for invoice in payload['invoices']:
+            partner = invoice['_customer_info']['partner']
+            conflicting = existing_moves.filtered(
+                lambda move: move.softlife_fiscal_accounting_key == invoice['_accounting_key']
+                and move.softlife_fiscal_invoice_id != invoice['platform_invoice_id'])
+            if conflicting:
+                self._fiscal_invoice_error(_('Fiscal accounting scope is already owned by another invoice.'))
+            for line, allocation in zip(invoice['lines'], invoice['allocations']):
+                product = products_by_id[line['odoo_product_id']]
+                sale = sales_by_id[allocation['odoo_sale_order_id']]
+                sale_line = sale_lines_by_id[allocation['odoo_sale_order_line_id']]
+                allowed_existing = existing_by_invoice.get(invoice['platform_invoice_id'])
+                conflicting_source_lines = existing_source_lines.filtered(
+                    lambda row: (
+                        row.softlife_fiscal_source_order_id == allocation['source_order_id']
+                        or row.softlife_fiscal_allocation_id == allocation['platform_allocation_id'])
+                    and row.move_id != allowed_existing)
+                if (
+                    not product.active or not product.sale_ok or not product.softlife_recipe_id
+                    or conflicting_source_lines
+                ):
+                    self._fiscal_invoice_error(_('Fiscal invoice source sales order does not match.'))
+                sale_line = self._validate_fiscal_v2_supporting_sale(
+                    invoice, line, allocation, company, sale, sale_line, allowed_existing,
+                )
+                line['_sale_line_id'] = sale_line.id
+                line['_source_order_id'] = allocation['source_order_id']
+                line['_supporting_sale_order_id'] = allocation['supporting_sale_order_id']
+                line['_supporting_source_sha256'] = allocation[
+                    'supporting_sale_order_source_sha256'
+                ]
+            existing_move = existing_by_invoice.get(invoice['platform_invoice_id'])
+            if existing_move:
+                if not partner:
+                    self._fiscal_invoice_error(_(
+                        'Existing fiscal invoice has no matching named customer identity.'
+                    ))
+                self._prepare_fiscal_v2_accounts(invoice, company, tax, contract, partner)
+                self._validate_fiscal_invoice_move_v2(
+                    existing_move, invoice, company, journal, tax, partner,
+                )
+                if existing_move.state != 'draft':
+                    self._fiscal_invoice_error(_(
+                        'Fiscal invoice draft creation cannot reuse a posted invoice.'
+                    ))
+        return configuration, tax, existing_by_invoice, payload
+
+    @api.model
+    def _prepare_fiscal_v2_accounts(self, invoice, company, tax, contract, partner):
+        fiscal_position = self.env['account.fiscal.position'].sudo().with_company(
+            company,
+        )._get_fiscal_position(partner.with_company(company))
+        for line in invoice['lines']:
+            product = self.env['product.product'].sudo().with_company(company).browse(
+                line['odoo_product_id']
+            )
+            account, taxes = self._effective_product_fiscal_configuration(
+                product, company, fiscal_position,
+            )
+            if (
+                not product.active or not product.sale_ok or not product.softlife_recipe_id
+                or not account or account.account_type not in ('income', 'income_other')
+                or account.code != str(contract['expected']['income_account_code'])
+                or not self._account_applies_to_company(account, company) or taxes != tax
+            ):
+                self._fiscal_invoice_error(_(
+                    'Fiscal invoice product mapping does not match the expected tax and income account.'
+                ))
+            line['account_id'] = account.id
+
+    @api.model
+    def _validate_fiscal_invoice_move_v2(self, move, invoice, company, journal, tax, partner):
+        snapshot = copy.deepcopy(invoice)
+        snapshot.pop('_customer_info')
+        accounting_key = snapshot.pop('_accounting_key')
+        for line in snapshot['lines']:
+            line.pop('_sale_line_id', None)
+            line.pop('_source_order_id', None)
+            line.pop('_supporting_sale_order_id', None)
+            line.pop('_supporting_source_sha256', None)
+        if (
+            move.softlife_fiscal_invoice_id != snapshot['platform_invoice_id']
+            or move.softlife_fiscal_payload_sha256 != snapshot['invoice_payload_sha256']
+            or move.softlife_fiscal_accounting_key != accounting_key
+            or move.softlife_fiscal_invoice_snapshot != snapshot
+            or move.company_id != company or move.journal_id != journal or move.partner_id != partner
+            or move.move_type != 'out_invoice' or move.currency_id != company.currency_id
+            or fields.Date.to_string(move.invoice_date) != snapshot['invoice_date']
+            or fields.Date.to_string(move.date) != snapshot['invoice_date']
+            or move.ref != snapshot['reference'] or move.state not in ('draft', 'posted')
+        ):
+            self._fiscal_invoice_error(_('Existing fiscal invoice does not match the frozen payload.'))
+        lines_by_allocation = {
+            line.softlife_fiscal_allocation_id: line
+            for line in move.invoice_line_ids.filtered(lambda row: row.display_type == 'product')
+        }
+        if set(lines_by_allocation) != {
+                line['platform_allocation_id'] for line in invoice['lines']}:
+            self._fiscal_invoice_error(_('Existing fiscal invoice source lines do not match.'))
+        for expected in invoice['lines']:
+            line = lines_by_allocation[expected['platform_allocation_id']]
+            if (
+                line.softlife_fiscal_source_order_id != expected['_source_order_id']
+                or line.softlife_supporting_sale_order_id != expected['_supporting_sale_order_id']
+                or line.softlife_supporting_source_sha256
+                != expected['_supporting_source_sha256']
+                or line.product_id.id != expected['odoo_product_id']
+                or line.name != expected['description'] or line.quantity != expected['quantity']
+                or abs(line.price_unit - self._fiscal_invoice_price_unit(expected, tax.price_include)) > 1e-9
+                or line.account_id.id != expected['account_id'] or line.tax_ids != tax
+                or line.sale_line_ids.ids != [expected['_sale_line_id']]
+                or self._amount_cents(line.price_total) != expected['gross_cents']
+                or self._amount_cents(line.price_subtotal) != expected['tax_base_cents']
+            ):
+                self._fiscal_invoice_error(_('Existing fiscal invoice source line does not match.'))
+        if self._amount_cents(move.amount_total) != invoice['expected_total_cents']:
+            self._fiscal_invoice_error(_('Existing fiscal invoice total does not match.'))
+
+    @api.model
     def _validate_fiscal_invoice_draft_payload(self, payload, contract):
+        if isinstance(payload, dict) and payload.get('contract_version') == 2:
+            return self._validate_fiscal_invoice_draft_payload_v2(payload, contract)
         if not isinstance(payload, dict) or set(payload) != {
                 'contract_version', 'configuration_report_id', 'configuration_payload_sha256',
                 'company', 'journal', 'customer', 'tax', 'invoices'}:
@@ -825,6 +1363,87 @@ class SoftlifeSyncClient(models.TransientModel):
         return configuration, tax, existing_by_id, payload
 
     @api.model
+    def _create_fiscal_invoice_drafts_v2(self, payload, contract):
+        configuration, tax, existing_by_id, payload = \
+            self._validate_fiscal_invoice_draft_payload_v2(payload, contract)
+        company, journal, _generic_customer, _rate = configuration
+        results = []
+        partners_by_customer = {}
+        with self.env.cr.savepoint():
+            for invoice in payload['invoices']:
+                info = invoice['_customer_info']
+                customer_id = info['request_id']
+                partner = info['partner'] or partners_by_customer.get(customer_id)
+                if not partner:
+                    with _softlife_fiscal_partner_internal_scope():
+                        partner = self.env['res.partner'].sudo().with_company(company).create(
+                            info['values']
+                        )
+                    partners_by_customer[customer_id] = partner
+                info['partner'] = partner
+            for invoice in payload['invoices']:
+                self._prepare_fiscal_v2_accounts(
+                    invoice, company, tax, contract, invoice['_customer_info']['partner'],
+                )
+            for invoice in payload['invoices']:
+                move = existing_by_id.get(invoice['platform_invoice_id'])
+                created = not move
+                partner = invoice['_customer_info']['partner']
+                if not move:
+                    line_commands = [Command.create({
+                        'product_id': line['odoo_product_id'],
+                        'name': line['description'], 'quantity': line['quantity'],
+                        'price_unit': self._fiscal_invoice_price_unit(line, tax.price_include),
+                        'account_id': line['account_id'], 'tax_ids': [Command.set(tax.ids)],
+                        'sale_line_ids': [Command.link(line['_sale_line_id'])],
+                        'softlife_fiscal_source_order_id': line['_source_order_id'],
+                        'softlife_fiscal_allocation_id': line['platform_allocation_id'],
+                        'softlife_supporting_sale_order_id': line['_supporting_sale_order_id'],
+                        'softlife_supporting_source_sha256': line[
+                            '_supporting_source_sha256'
+                        ],
+                    }) for line in invoice['lines']]
+                    snapshot = copy.deepcopy(invoice)
+                    snapshot.pop('_customer_info')
+                    accounting_key = snapshot.pop('_accounting_key')
+                    for line in snapshot['lines']:
+                        line.pop('_sale_line_id')
+                        line.pop('_source_order_id')
+                        line.pop('_supporting_sale_order_id')
+                        line.pop('_supporting_source_sha256')
+                    with _softlife_fiscal_internal_scope():
+                        move = self.env['account.move'].sudo().with_company(company).create({
+                            'company_id': company.id, 'journal_id': journal.id,
+                            'partner_id': partner.id, 'move_type': 'out_invoice',
+                            'currency_id': company.currency_id.id,
+                            'date': invoice['invoice_date'], 'invoice_date': invoice['invoice_date'],
+                            'ref': invoice['reference'], 'invoice_line_ids': line_commands,
+                            'softlife_fiscal_invoice_id': invoice['platform_invoice_id'],
+                            'softlife_fiscal_payload_sha256': invoice['invoice_payload_sha256'],
+                            'softlife_fiscal_invoice_snapshot': snapshot,
+                            'softlife_fiscal_accounting_key': accounting_key,
+                        })
+                self._validate_fiscal_invoice_move_v2(
+                    move, invoice, company, journal, tax, partner,
+                )
+                if move.state != 'draft':
+                    self._fiscal_invoice_error(_(
+                        'Fiscal invoice draft creation cannot reuse a posted invoice.'
+                    ))
+                results.append({
+                    'platform_invoice_id': invoice['platform_invoice_id'],
+                    'odoo_move_id': move.id,
+                    'invoice_payload_sha256': invoice['invoice_payload_sha256'],
+                    'state': move.state, 'created': created,
+                })
+        return {
+            'accepted': True,
+            'summary': _('Created or verified %s source-bound fiscal invoice draft(s).') % len(results),
+            'contract_version': 2,
+            'invoices': results,
+        }
+
+    @api.model
     def _create_fiscal_invoice_drafts(self, payload):
         if not self._fiscal_invoice_draft_creation_enabled():
             raise SoftlifeAPIError(
@@ -832,6 +1451,8 @@ class SoftlifeSyncClient(models.TransientModel):
                 code='fiscal_invoice_draft_creation_disabled',
             )
         contract = self._api_request('GET', '/api/internal/odoo/fiscal-configuration')
+        if isinstance(payload, dict) and payload.get('contract_version') == 2:
+            return self._create_fiscal_invoice_drafts_v2(payload, contract)
         configuration, tax, existing_by_id, payload = self._validate_fiscal_invoice_draft_payload(
             payload, contract,
         )
@@ -891,7 +1512,7 @@ class SoftlifeSyncClient(models.TransientModel):
             )
         if not isinstance(payload, dict) or set(payload) != {'contract_version', 'company', 'invoices'}:
             self._fiscal_invoice_error(_('Fiscal invoice confirmation payload fields are invalid.'))
-        if payload['contract_version'] != 1 or isinstance(payload['contract_version'], bool):
+        if payload['contract_version'] not in (1, 2) or isinstance(payload['contract_version'], bool):
             self._fiscal_invoice_error(_('Fiscal invoice confirmation contract version is unsupported.'))
         if not isinstance(payload['company'], dict) or set(payload['company']) != {'odoo_id'}:
             self._fiscal_invoice_error(_('Fiscal invoice confirmation company fields are invalid.'))
@@ -899,6 +1520,8 @@ class SoftlifeSyncClient(models.TransientModel):
         if not isinstance(invoices, list) or not 1 <= len(invoices) <= 500:
             self._fiscal_invoice_error(_('Fiscal invoice confirmation requires 1 to 500 invoices.'))
         contract = self._api_request('GET', '/api/internal/odoo/fiscal-configuration')
+        if payload['contract_version'] == 2:
+            self._require_fiscal_v2_zero_value_capability(contract)
         configuration = self._current_fiscal_invoice_configuration(contract)
         company, journal, customer, _rate = configuration
         if (
@@ -928,6 +1551,23 @@ class SoftlifeSyncClient(models.TransientModel):
                 self._fiscal_invoice_error(_('Fiscal invoice confirmation identity is invalid.'))
             platform_ids.add(row['platform_invoice_id'])
             move_ids.add(row['odoo_move_id'])
+        if payload['contract_version'] == 2:
+            provisional_moves = self.env['account.move'].sudo().browse(list(move_ids)).exists()
+            if set(provisional_moves.ids) != move_ids:
+                self._fiscal_invoice_error(_('Fiscal invoice confirmation contains an unknown move.'))
+            local_months = set()
+            for move in provisional_moves:
+                snapshot = move.softlife_fiscal_invoice_snapshot
+                local_month = snapshot.get('local_month') if isinstance(snapshot, dict) else None
+                if not isinstance(local_month, str) or not re.fullmatch(
+                        r'\d{4}-(0[1-9]|1[0-2])', local_month):
+                    self._fiscal_invoice_error(_('Stored fiscal invoice month is invalid.'))
+                local_months.add(local_month)
+            for local_month in sorted(local_months):
+                scope_month = datetime.date.fromisoformat(local_month + '-01')
+                softlife_company_month_advisory_lock(
+                    self.env.cr, company.id, scope_month,
+                )
         self.env.cr.execute(
             'SELECT id FROM account_move WHERE id IN %s FOR UPDATE',
             [tuple(move_ids)],
@@ -940,13 +1580,15 @@ class SoftlifeSyncClient(models.TransientModel):
         moves_by_id = {move.id: move for move in moves}
         ordered = []
         snapshots = {}
+        v2_coverage = {}
         for row in invoices:
             move = moves_by_id[row['odoo_move_id']]
             if (
                 move.softlife_fiscal_invoice_id != row['platform_invoice_id']
                 or move.softlife_fiscal_payload_sha256 != row['invoice_payload_sha256']
                 or move.company_id != company or move.journal_id != journal
-                or move.partner_id != customer or move.move_type != 'out_invoice'
+                or payload['contract_version'] == 1 and move.partner_id != customer
+                or move.move_type != 'out_invoice'
                 or move.currency_id != company.currency_id or move.state not in ('draft', 'posted')
             ):
                 self._fiscal_invoice_error(_('Fiscal invoice confirmation move does not match Odoo.'))
@@ -967,9 +1609,68 @@ class SoftlifeSyncClient(models.TransientModel):
                 'amount_type': tax.amount_type,
                 'price_include': bool(tax.price_include),
             }, company, configuration[3])
-            self._validate_fiscal_invoice_move(move, snapshot, configuration, tax)
+            if payload['contract_version'] == 2:
+                if snapshot.get('invoice_mode') not in (
+                        'individual_requested', 'monthly_consolidated'):
+                    self._fiscal_invoice_error(_('Fiscal invoice confirmation contract does not match its snapshot.'))
+                customer_info = self._prepare_fiscal_v2_customer(
+                    snapshot.get('customer'), customer, company,
+                )
+                if not customer_info['partner'] or customer_info['partner'] != move.partner_id:
+                    self._fiscal_invoice_error(_('Fiscal invoice named customer no longer matches Odoo.'))
+                prepared_snapshot = copy.deepcopy(snapshot)
+                if len(prepared_snapshot.get('lines', [])) != len(
+                        prepared_snapshot.get('allocations', [])):
+                    self._fiscal_invoice_error(_('Stored fiscal invoice allocation coverage is invalid.'))
+                scope = (company.id, prepared_snapshot.get('local_month'))
+                supporting_sale_ids = {
+                    allocation.get('odoo_sale_order_id')
+                    for allocation in prepared_snapshot['allocations']
+                }
+                if supporting_sale_ids:
+                    self.env.cr.execute(
+                        'SELECT id FROM sale_order WHERE id IN %s ORDER BY id FOR UPDATE',
+                        [tuple(sorted(supporting_sale_ids))],
+                    )
+                for line, allocation in zip(
+                        prepared_snapshot.get('lines', []),
+                        prepared_snapshot.get('allocations', [])):
+                    sale_line = self._validate_fiscal_v2_supporting_sale(
+                        prepared_snapshot, line, allocation, company, allowed_move=move,
+                    )
+                    line['_sale_line_id'] = sale_line.id
+                    line['_source_order_id'] = allocation['source_order_id']
+                    line['_supporting_sale_order_id'] = allocation['supporting_sale_order_id']
+                    line['_supporting_source_sha256'] = allocation[
+                        'supporting_sale_order_source_sha256'
+                    ]
+                    coverage = v2_coverage.setdefault(scope, {
+                        'source_ids': set(), 'sale_ids': set(),
+                    })
+                    if allocation['source_order_id'] in coverage['source_ids']:
+                        self._fiscal_invoice_error(_(
+                            'Fiscal invoice confirmation contains duplicate source coverage.'
+                        ))
+                    coverage['source_ids'].add(allocation['source_order_id'])
+                    coverage['sale_ids'].add(allocation['odoo_sale_order_id'])
+                prepared_snapshot['_customer_info'] = {'partner': move.partner_id}
+                prepared_snapshot['_accounting_key'] = move.softlife_fiscal_accounting_key
+                self._prepare_fiscal_v2_accounts(
+                    prepared_snapshot, company, tax, contract, move.partner_id,
+                )
+                self._validate_fiscal_invoice_move_v2(
+                    move, prepared_snapshot, company, journal, tax, move.partner_id,
+                )
+            else:
+                if snapshot.get('invoice_mode'):
+                    self._fiscal_invoice_error(_('Fiscal invoice confirmation contract does not match its snapshot.'))
+                self._validate_fiscal_invoice_move(move, snapshot, configuration, tax)
             snapshots[move.id] = (snapshot, tax)
             ordered.append(move)
+        for scope, coverage in v2_coverage.items():
+            self._validate_fiscal_v2_included_sales(
+                company, scope[1], coverage['source_ids'], coverage['sale_ids'],
+            )
         was_draft = {move.id: move.state == 'draft' for move in ordered}
         with self.env.cr.savepoint():
             drafts = self.env['account.move'].browse([
@@ -980,7 +1681,30 @@ class SoftlifeSyncClient(models.TransientModel):
                     drafts.action_post()
             for move in ordered:
                 snapshot, tax = snapshots[move.id]
-                self._validate_fiscal_invoice_move(move, snapshot, configuration, tax)
+                if payload['contract_version'] == 2:
+                    prepared_snapshot = copy.deepcopy(snapshot)
+                    for line, allocation in zip(
+                            prepared_snapshot.get('lines', []),
+                            prepared_snapshot.get('allocations', [])):
+                        sale_line = self._validate_fiscal_v2_supporting_sale(
+                            prepared_snapshot, line, allocation, company, allowed_move=move,
+                        )
+                        line['_sale_line_id'] = sale_line.id
+                        line['_source_order_id'] = allocation['source_order_id']
+                        line['_supporting_sale_order_id'] = allocation['supporting_sale_order_id']
+                        line['_supporting_source_sha256'] = allocation[
+                            'supporting_sale_order_source_sha256'
+                        ]
+                    prepared_snapshot['_customer_info'] = {'partner': move.partner_id}
+                    prepared_snapshot['_accounting_key'] = move.softlife_fiscal_accounting_key
+                    self._prepare_fiscal_v2_accounts(
+                        prepared_snapshot, company, tax, contract, move.partner_id,
+                    )
+                    self._validate_fiscal_invoice_move_v2(
+                        move, prepared_snapshot, company, journal, tax, move.partner_id,
+                    )
+                else:
+                    self._validate_fiscal_invoice_move(move, snapshot, configuration, tax)
                 if move.state != 'posted' or not move.name:
                     self._fiscal_invoice_error(_(
                         'Fiscal invoice confirmation did not post every listed move.'
@@ -988,7 +1712,7 @@ class SoftlifeSyncClient(models.TransientModel):
         return {
             'accepted': True,
             'summary': _('Confirmed or verified %s fiscal invoice(s).') % len(ordered),
-            'contract_version': 1,
+            'contract_version': payload['contract_version'],
             'invoices': [{
                 'platform_invoice_id': row['platform_invoice_id'],
                 'odoo_move_id': move.id,

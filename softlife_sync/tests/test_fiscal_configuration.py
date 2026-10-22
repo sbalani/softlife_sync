@@ -91,6 +91,8 @@ class TestFiscalConfiguration(TransactionCase):
             'fiscal_invoice_draft_creation': 1,
             'fiscal_invoice_bulk_confirmation': 1,
             'fiscal_zero_value_invoices': 2,
+            'manufacturing_transaction_sales': 1,
+            'fiscal_invoice_allocation_v2': 1,
         })
         self.assertEqual(payload['income_account'], {
             'odoo_id': expected_income.id,

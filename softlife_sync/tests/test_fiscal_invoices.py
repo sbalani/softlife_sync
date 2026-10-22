@@ -7,6 +7,7 @@ from odoo.exceptions import UserError
 from odoo.tests.common import TransactionCase
 
 from ..models.softlife_sync_client import SoftlifeAPIError
+from ..models.manufacturing_documents import _softlife_manufacturing_internal_scope
 
 
 class TestFiscalInvoices(TransactionCase):
@@ -50,7 +51,7 @@ class TestFiscalInvoices(TransactionCase):
             'property_account_income_categ_id': account.id,
         })
         product = self.env['product.product'].with_company(company).create({
-            'name': 'SoftLife fiscal invoice product', 'sale_ok': True,
+            'name': 'SoftLife fiscal invoice product', 'sale_ok': True, 'type': 'service',
             'categ_id': category.id, 'softlife_recipe_id': 'fiscal-invoice-test',
             'taxes_id': [(6, 0, tax.ids)],
         })
@@ -59,6 +60,7 @@ class TestFiscalInvoices(TransactionCase):
         )
         contract = {
             'contract_version': 1,
+            'required_capabilities': {'fiscal_zero_value_invoices': 2},
             'expected': {
                 'journal_code': journal.code, 'customer_odoo_id': customer.id,
                 'vat_rate': 10, 'currency': 'EUR', 'income_account_code': account.code,
@@ -98,6 +100,97 @@ class TestFiscalInvoices(TransactionCase):
             'invoices': invoices,
         }
         return company, journal, customer, tax, product, contract, payload
+
+    def _v2_source_sale(self, customer, product, source_id):
+        warehouse = self.env['stock.warehouse'].search([
+            ('company_id', '=', self.env.company.id),
+        ], limit=1)
+        if not warehouse:
+            self.skipTest('Test company has no warehouse.')
+        line_key = f'{source_id}:1'
+        with _softlife_manufacturing_internal_scope():
+            sale = self.env['sale.order'].create({
+                'partner_id': customer.id, 'warehouse_id': warehouse.id,
+                'softlife_warehouse_id': warehouse.id,
+                'softlife_sale_key': f'transaction:{source_id}',
+                'softlife_source_order_id': source_id,
+                'softlife_source_payload_sha256': 'b' * 64,
+                'softlife_manufacturing_contract_version': 3,
+                'softlife_document_date': '2026-09-29',
+                'softlife_source_orders': [{'platform_order_id': source_id}],
+                'order_line': [(0, 0, {
+                    'product_id': product.id, 'name': 'Fiscal sale 1',
+                    'product_uom_qty': 1,
+                    'product_uom': product.uom_id.id, 'price_unit': 11,
+                    'tax_id': [(6, 0, [])],
+                    'softlife_platform_line_key': line_key,
+                })],
+            })
+        with _softlife_manufacturing_internal_scope():
+            sale.action_confirm()
+        sale.order_line.qty_delivered = 1
+        return sale
+
+    def _v2_payload(self, company, customer, payload, sources, mode):
+        invoice = payload['invoices'][0]
+        invoice['invoice_mode'] = mode
+        invoice['local_month'] = '2026-09'
+        request_id = None
+        if mode == 'monthly_consolidated':
+            invoice['customer'] = {'odoo_id': customer.id}
+        else:
+            state = self.env['res.country.state'].search([
+                ('country_id.code', '=', 'ES'),
+            ], limit=1)
+            if not state:
+                self.skipTest('Spanish fiscal test requires one configured province.')
+            request_id = str(uuid.uuid4())
+            details = {
+                'legal_name': 'Requested Customer', 'tax_id': 'ES12345678Z',
+                'email': 'customer@example.com', 'address': 'Calle Test 1',
+                'postal_code': '28001', 'city': 'Madrid', 'province': state.name,
+                'country_code': 'ES',
+            }
+            invoice['customer'] = {
+                **details, 'request_id': request_id,
+                'fiscal_details_sha256': self._hash(details),
+            }
+        base_line = invoice['lines'][0]
+        allocations = []
+        lines = []
+        for index, source_id in enumerate(sources, start=1):
+            sale = self.env['sale.order'].search([
+                ('softlife_source_order_id', '=', source_id),
+            ], limit=1)
+            allocation_id = str(uuid.uuid4())
+            allocation = {
+                'platform_allocation_id': allocation_id,
+                'preflight_item_id': str(uuid.uuid4()), 'source_order_id': source_id,
+                'source_sha256': 'c' * 64,
+                'supporting_sale_order_source_sha256': 'b' * 64,
+                'invoice_request_id': request_id,
+                'supporting_sale_order_id': str(uuid.uuid4()),
+                'odoo_sale_order_id': sale.id,
+                'odoo_sale_order_line_id': sale.order_line.id,
+                'line_sequence': index,
+            }
+            allocations.append(allocation)
+            lines.append({
+                **base_line, 'platform_allocation_id': allocation_id,
+                'zero_value_reason': invoice.get('zero_value_reason'),
+                'odoo_sale_order_id': sale.id,
+                'odoo_sale_order_line_id': sale.order_line.id,
+            })
+        invoice['allocations'] = allocations
+        invoice['lines'] = lines
+        invoice['expected_total_cents'] = 1100 * len(sources)
+        invoice['invoice_payload_sha256'] = self._hash({
+            key: value for key, value in invoice.items() if key != 'invoice_payload_sha256'
+        })
+        payload['contract_version'] = 2
+        payload['local_month'] = '2026-09'
+        payload.pop('customer')
+        return payload
 
     def test_independent_opt_ins_fail_before_platform_calls(self):
         Client = type(self.client)
@@ -395,28 +488,30 @@ class TestFiscalInvoices(TransactionCase):
             self.skipTest('Test company has no warehouse.')
         source_order_id = str(uuid.uuid4())
         export_id = str(uuid.uuid4())
-        sale = self.env['sale.order'].create({
-            'partner_id': customer.id,
-            'warehouse_id': warehouse.id,
-            'date_order': '2026-09-29 00:00:00',
-            'softlife_export_id': export_id,
-            'softlife_warehouse_id': warehouse.id,
-            'softlife_source_orders': [{
-                'platform_order_id': source_order_id,
-                'order_code': 'TEST-ORDER',
-                'machine_id': str(uuid.uuid4()),
-                'machine_imei': 'TEST-IMEI',
-                'machine_name': 'Test machine',
-            }],
-            'order_line': [(0, 0, {
-                'product_id': product.id,
-                'product_uom_qty': 1,
-                'product_uom': product.uom_id.id,
-                'price_unit': 11,
-                'tax_id': [(6, 0, [])],
-            })],
-        })
-        sale.action_confirm()
+        with _softlife_manufacturing_internal_scope():
+            sale = self.env['sale.order'].create({
+                'partner_id': customer.id,
+                'warehouse_id': warehouse.id,
+                'date_order': '2026-09-29 00:00:00',
+                'softlife_export_id': export_id,
+                'softlife_warehouse_id': warehouse.id,
+                'softlife_source_orders': [{
+                    'platform_order_id': source_order_id,
+                    'order_code': 'TEST-ORDER',
+                    'machine_id': str(uuid.uuid4()),
+                    'machine_imei': 'TEST-IMEI',
+                    'machine_name': 'Test machine',
+                }],
+                'order_line': [(0, 0, {
+                    'product_id': product.id,
+                    'product_uom_qty': 1,
+                    'product_uom': product.uom_id.id,
+                    'price_unit': 11,
+                    'tax_id': [(6, 0, [])],
+                })],
+            })
+        with _softlife_manufacturing_internal_scope():
+            sale.action_confirm()
         link_payload = {
             'contract_version': 1,
             'local_month': '2026-09',
@@ -463,13 +558,15 @@ class TestFiscalInvoices(TransactionCase):
         warehouse = self.env['stock.warehouse'].search([('company_id', '=', company.id)], limit=1)
         if not warehouse:
             self.skipTest('Test company has no warehouse.')
-        sale = self.env['sale.order'].create({
-            'partner_id': customer.id, 'warehouse_id': warehouse.id,
-            'softlife_export_id': str(uuid.uuid4()), 'softlife_warehouse_id': warehouse.id,
-            'softlife_source_orders': [{'platform_order_id': str(uuid.uuid4())}],
-            'order_line': [(0, 0, {'product_id': product.id, 'product_uom_qty': 1, 'price_unit': 11, 'tax_id': [(6, 0, [])]})],
-        })
-        sale.action_confirm()
+        with _softlife_manufacturing_internal_scope():
+            sale = self.env['sale.order'].create({
+                'partner_id': customer.id, 'warehouse_id': warehouse.id,
+                'softlife_export_id': str(uuid.uuid4()), 'softlife_warehouse_id': warehouse.id,
+                'softlife_source_orders': [{'platform_order_id': str(uuid.uuid4())}],
+                'order_line': [(0, 0, {'product_id': product.id, 'product_uom_qty': 1, 'price_unit': 11, 'tax_id': [(6, 0, [])]})],
+            })
+        with _softlife_manufacturing_internal_scope():
+            sale.action_confirm()
         link_payload = {
             'contract_version': 1, 'local_month': '2026-09',
             'links': [{
@@ -488,6 +585,271 @@ class TestFiscalInvoices(TransactionCase):
             self.client._link_fiscal_invoices_to_sales(link_payload)
         self.assertFalse(self.env['account.move'].browse(
             draft['odoo_move_id']).invoice_line_ids.sale_line_ids)
+
+    def test_v2_named_invoice_creates_partner_and_exact_source_link_idempotently(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_id = str(uuid.uuid4())
+        sale = self._v2_source_sale(customer, product, source_id)
+        payload = self._v2_payload(
+            company, customer, payload, [source_id], 'individual_requested',
+        )
+        Client = type(self.client)
+        FiscalPosition = type(self.env['account.fiscal.position'])
+        no_fiscal_position = self.env['account.fiscal.position']
+
+        with patch.object(Client, '_fiscal_invoice_draft_creation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract), \
+                patch.object(FiscalPosition, '_get_fiscal_position',
+                             return_value=no_fiscal_position):
+            first = self.client._create_fiscal_invoice_drafts(payload)
+            second = self.client._create_fiscal_invoice_drafts(payload)
+
+        move = self.env['account.move'].browse(first['invoices'][0]['odoo_move_id'])
+        self.assertEqual(first['contract_version'], 2)
+        self.assertTrue(first['invoices'][0]['created'])
+        self.assertFalse(second['invoices'][0]['created'])
+        request_id = payload['invoices'][0]['customer']['request_id']
+        self.assertEqual(move.softlife_fiscal_accounting_key, f'individual:{request_id}')
+        self.assertEqual(move.invoice_line_ids.softlife_fiscal_source_order_id, source_id)
+        self.assertEqual(
+            move.invoice_line_ids.softlife_fiscal_allocation_id,
+            payload['invoices'][0]['allocations'][0]['platform_allocation_id'],
+        )
+        self.assertEqual(move.invoice_line_ids.sale_line_ids, sale.order_line)
+        self.assertEqual(move.partner_id.softlife_fiscal_customer_id,
+                         request_id)
+        confirmation = {
+            'contract_version': 2, 'company': {'odoo_id': company.id},
+            'invoices': [{
+                'platform_invoice_id': first['invoices'][0]['platform_invoice_id'],
+                'odoo_move_id': move.id,
+                'invoice_payload_sha256': first['invoices'][0]['invoice_payload_sha256'],
+            }],
+        }
+        with patch.object(Client, '_fiscal_invoice_confirmation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract), \
+                patch.object(FiscalPosition, '_get_fiscal_position',
+                             return_value=no_fiscal_position):
+            confirmed = self.client._confirm_fiscal_invoices(confirmation)
+            retried = self.client._confirm_fiscal_invoices(confirmation)
+        self.assertEqual(confirmed['contract_version'], 2)
+        self.assertTrue(confirmed['invoices'][0]['confirmed'])
+        self.assertFalse(retried['invoices'][0]['confirmed'])
+        self.assertEqual(move.state, 'posted')
+
+    def test_v2_consolidated_invoice_keeps_one_line_per_source_sale(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        sales = self.env['sale.order']
+        for source_id in source_ids:
+            sales |= self._v2_source_sale(customer, product, source_id)
+        payload = self._v2_payload(
+            company, customer, payload, source_ids, 'monthly_consolidated',
+        )
+        Client = type(self.client)
+
+        with patch.object(Client, '_fiscal_invoice_draft_creation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract):
+            result = self.client._create_fiscal_invoice_drafts(payload)
+
+        move = self.env['account.move'].browse(result['invoices'][0]['odoo_move_id'])
+        self.assertEqual(move.softlife_fiscal_accounting_key,
+                         f'consolidated:{company.id}:2026-09')
+        self.assertEqual(set(move.invoice_line_ids.mapped('softlife_fiscal_source_order_id')),
+                         set(source_ids))
+        self.assertEqual(len(move.invoice_line_ids), 2)
+        self.assertEqual(set(move.invoice_line_ids.sale_line_ids.ids), set(sales.order_line.ids))
+
+    def test_v2_rejects_duplicate_source_before_creating_accounting(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_id = str(uuid.uuid4())
+        self._v2_source_sale(customer, product, source_id)
+        payload = self._v2_payload(
+            company, customer, payload, [source_id, source_id], 'monthly_consolidated',
+        )
+
+        with self.assertRaisesRegex(SoftlifeAPIError, 'allocation identity is invalid'):
+            self.client._validate_fiscal_invoice_draft_payload_v2(payload, contract)
+        self.assertFalse(self.env['account.move'].search([
+            ('softlife_fiscal_accounting_key', '=', f'consolidated:{company.id}:2026-09'),
+        ]))
+
+    def test_v2_allows_platform_excluded_refund_sale_outside_payload(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        included_sale = self._v2_source_sale(customer, product, source_ids[0])
+        # Refund exclusion is authoritative on the platform; its supporting Odoo sale remains.
+        platform_excluded_refund_sale = self._v2_source_sale(
+            customer, product, source_ids[1],
+        )
+        payload = self._v2_payload(
+            company, customer, payload, source_ids[:1], 'monthly_consolidated',
+        )
+
+        _configuration, _tax, _existing, validated = \
+            self.client._validate_fiscal_invoice_draft_payload_v2(payload, contract)
+
+        self.assertEqual(
+            validated['invoices'][0]['allocations'][0]['odoo_sale_order_id'],
+            included_sale.id,
+        )
+        self.assertNotEqual(platform_excluded_refund_sale, included_sale)
+
+    def test_v2_requires_zero_value_capability_version_two(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_id = str(uuid.uuid4())
+        self._v2_source_sale(customer, product, source_id)
+        payload = self._v2_payload(
+            company, customer, payload, [source_id], 'monthly_consolidated',
+        )
+        contract['required_capabilities']['fiscal_zero_value_invoices'] = 1
+
+        with self.assertRaisesRegex(SoftlifeAPIError, 'capability version 2'):
+            self.client._validate_fiscal_invoice_draft_payload_v2(payload, contract)
+
+    def test_v2_rejects_supporting_sale_hash_mismatch(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_id = str(uuid.uuid4())
+        self._v2_source_sale(customer, product, source_id)
+        payload = self._v2_payload(
+            company, customer, payload, [source_id], 'monthly_consolidated',
+        )
+        invoice = payload['invoices'][0]
+        invoice['allocations'][0]['supporting_sale_order_source_sha256'] = 'd' * 64
+        invoice['invoice_payload_sha256'] = self._hash({
+            key: value for key, value in invoice.items() if key != 'invoice_payload_sha256'
+        })
+
+        with self.assertRaisesRegex(SoftlifeAPIError, 'source sales order does not match'):
+            self.client._validate_fiscal_invoice_draft_payload_v2(payload, contract)
+
+    def test_v2_rejects_customer_snapshot_hash_mismatch(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_id = str(uuid.uuid4())
+        self._v2_source_sale(customer, product, source_id)
+        payload = self._v2_payload(
+            company, customer, payload, [source_id], 'individual_requested',
+        )
+        invoice = payload['invoices'][0]
+        invoice['customer']['fiscal_details_sha256'] = 'd' * 64
+        invoice['invoice_payload_sha256'] = self._hash({
+            key: value for key, value in invoice.items() if key != 'invoice_payload_sha256'
+        })
+
+        with self.assertRaisesRegex(SoftlifeAPIError, 'snapshot hash is invalid'):
+            self.client._validate_fiscal_invoice_draft_payload_v2(payload, contract)
+
+    def test_v2_rejects_inconsistent_line_zero_value_reason(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_id = str(uuid.uuid4())
+        self._v2_source_sale(customer, product, source_id)
+        payload = self._v2_payload(
+            company, customer, payload, [source_id], 'monthly_consolidated',
+        )
+        invoice = payload['invoices'][0]
+        invoice['lines'][0]['zero_value_reason'] = 'free'
+        invoice['invoice_payload_sha256'] = self._hash({
+            key: value for key, value in invoice.items() if key != 'invoice_payload_sha256'
+        })
+
+        with self.assertRaisesRegex(SoftlifeAPIError, 'line values are invalid'):
+            self.client._validate_fiscal_invoice_draft_payload_v2(payload, contract)
+
+    def test_v2_accepts_canonical_consolidated_zero_value_line(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_id = str(uuid.uuid4())
+        sale = self._v2_source_sale(customer, product, source_id)
+        with _softlife_manufacturing_internal_scope():
+            sale.order_line.price_unit = 0
+        payload = self._v2_payload(
+            company, customer, payload, [source_id], 'monthly_consolidated',
+        )
+        invoice = payload['invoices'][0]
+        invoice['expected_total_cents'] = 0
+        invoice['zero_value_reason'] = None
+        invoice['lines'][0].update({
+            'gross_cents': 0, 'tax_base_cents': 0, 'vat_cents': 0,
+            'zero_value_reason': 'free',
+        })
+        invoice['invoice_payload_sha256'] = self._hash({
+            key: value for key, value in invoice.items() if key != 'invoice_payload_sha256'
+        })
+
+        self.client._validate_fiscal_invoice_draft_payload_v2(payload, contract)
+
+    def test_v2_rejects_more_than_5000_total_lines(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_id = str(uuid.uuid4())
+        self._v2_source_sale(customer, product, source_id)
+        payload = self._v2_payload(
+            company, customer, payload, [source_id], 'monthly_consolidated',
+        )
+        invoice = payload['invoices'][0]
+        invoice['allocations'] = invoice['allocations'] * 5001
+        invoice['lines'] = invoice['lines'] * 5001
+        invoice['invoice_payload_sha256'] = self._hash({
+            key: value for key, value in invoice.items() if key != 'invoice_payload_sha256'
+        })
+
+        with self.assertRaisesRegex(SoftlifeAPIError, 'more than 5000 lines'):
+            self.client._validate_fiscal_invoice_draft_payload_v2(payload, contract)
+
+    def test_v2_fiscal_partner_snapshot_fields_are_frozen(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_id = str(uuid.uuid4())
+        self._v2_source_sale(customer, product, source_id)
+        payload = self._v2_payload(
+            company, customer, payload, [source_id], 'individual_requested',
+        )
+        Client = type(self.client)
+        with patch.object(Client, '_fiscal_invoice_draft_creation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract):
+            result = self.client._create_fiscal_invoice_drafts(payload)
+        partner = self.env['account.move'].browse(
+            result['invoices'][0]['odoo_move_id']
+        ).partner_id
+
+        with self.assertRaisesRegex(UserError, 'snapshot fields are frozen'):
+            partner.write({'email': 'changed@example.com'})
+
+    def test_v2_confirmation_revalidates_supporting_sale_line(self):
+        company, journal, customer, tax, product, contract, payload = \
+            self._records_and_payload()
+        source_id = str(uuid.uuid4())
+        sale = self._v2_source_sale(customer, product, source_id)
+        payload = self._v2_payload(
+            company, customer, payload, [source_id], 'monthly_consolidated',
+        )
+        Client = type(self.client)
+        with patch.object(Client, '_fiscal_invoice_draft_creation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract):
+            draft = self.client._create_fiscal_invoice_drafts(payload)['invoices'][0]
+        with _softlife_manufacturing_internal_scope():
+            sale.order_line.price_unit = 12
+        confirmation = {
+            'contract_version': 2, 'company': {'odoo_id': company.id},
+            'invoices': [{
+                'platform_invoice_id': draft['platform_invoice_id'],
+                'odoo_move_id': draft['odoo_move_id'],
+                'invoice_payload_sha256': draft['invoice_payload_sha256'],
+            }],
+        }
+
+        with patch.object(Client, '_fiscal_invoice_confirmation_enabled', return_value=True), \
+                patch.object(Client, '_api_request', return_value=contract), \
+                self.assertRaisesRegex(SoftlifeAPIError, 'source sales order does not match'):
+            self.client._confirm_fiscal_invoices(confirmation)
 
     def test_settings_require_company_for_each_new_opt_in(self):
         Params = self.env['ir.config_parameter'].sudo()

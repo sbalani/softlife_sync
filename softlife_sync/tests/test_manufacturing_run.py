@@ -1,7 +1,12 @@
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+import uuid
 
+from odoo import fields
 from odoo.exceptions import UserError, ValidationError
 from odoo.tests.common import TransactionCase
+
+from ..models.locks import softlife_company_month_advisory_lock
+from ..models.manufacturing_documents import _softlife_manufacturing_internal_scope
 
 
 class TestManufacturingRun(TransactionCase):
@@ -87,6 +92,297 @@ class TestManufacturingRun(TransactionCase):
 
         with self.assertRaisesRegex(ValidationError, 'contract version 2'):
             run._process_documents()
+
+    def test_september_rejects_aggregate_contract(self):
+        run = self.env['softlife.manufacturing.run'].new({
+            'document_date': '2026-09-01',
+            'payload': {'manufacturing_contract_version': 2, 'warehouses': [{}]},
+        })
+
+        with self.assertRaisesRegex(ValidationError, 'contract 3 is required'):
+            run._process_documents()
+
+    def test_august_rejects_transaction_contract(self):
+        run = self.env['softlife.manufacturing.run'].new({
+            'document_date': '2026-08-31',
+            'payload': {'manufacturing_contract_version': 3, 'warehouses': [{}]},
+        })
+
+        with self.assertRaisesRegex(ValidationError, 'reserved for pre-September'):
+            run._process_documents()
+
+    def test_contract_three_requires_recipe_payload_contract_two(self):
+        run = self.env['softlife.manufacturing.run'].new({
+            'document_date': '2026-09-30',
+            'payload': {
+                'payload_contract_version': 3,
+                'manufacturing_contract_version': 3,
+                'warehouses': [{}],
+            },
+        })
+
+        with self.assertRaisesRegex(ValidationError, 'payload_contract_version 2'):
+            run._process_documents()
+
+    def test_contract_three_locks_document_month_before_sales_validation(self):
+        run = self.env['softlife.manufacturing.run'].new({
+            'document_date': '2026-09-30',
+            'payload': {
+                'payload_contract_version': 2,
+                'manufacturing_contract_version': 3,
+                'warehouses': [{}],
+            },
+        })
+        events = []
+
+        def stop_validation(_warehouses):
+            events.append('validate')
+            raise ValidationError('stop after lock')
+
+        with patch.object(type(run), '_lock_company_month',
+                          side_effect=lambda date: events.append(('lock', date))), \
+                patch.object(type(run), '_validate_contract_three_sales',
+                             side_effect=stop_validation), \
+                self.assertRaisesRegex(ValidationError, 'stop after lock'):
+            run._process_documents()
+
+        self.assertEqual(events, [
+            ('lock', fields.Date.to_date('2026-09-30')), 'validate',
+        ])
+
+    def test_company_month_lock_uses_fiscal_key_shape(self):
+        cursor = Mock()
+
+        key = softlife_company_month_advisory_lock(cursor, 17, '2026-09-30')
+
+        self.assertEqual(key, 202609)
+        cursor.execute.assert_called_once_with(
+            'SELECT pg_advisory_xact_lock(%s, %s)', [17, 202609],
+        )
+
+    def test_contract_three_sales_values_require_exact_unique_identity(self):
+        run = self.env['softlife.manufacturing.run'].new({
+            'document_date': '2026-09-30',
+        })
+        product = self.env['product.product'].create({'name': 'Transaction product'})
+        source_id = str(uuid.uuid4())
+        recipe_version_id = str(uuid.uuid4())
+        currency = self.env.company.currency_id
+        line_key = f'{source_id}:1'
+        sale = {
+            'platform_order_id': source_id, 'platform_line_key': line_key,
+            'source_sha256': 'a' * 64, 'recipe_version_id': recipe_version_id,
+            'order_code': 'TX-1',
+            'order_date': '2026-09-29', 'customer_odoo_id': 7,
+            'currency': currency.name, 'reference': 'TX-1', 'expected_total_cents': 800,
+            'lines': [{
+                'platform_line_key': line_key, 'odoo_product_id': product.id,
+                'description': 'Transaction product', 'quantity': 2, 'gross_cents': 800,
+            }],
+        }
+        warehouse = {
+            'odoo_customer_id': 7,
+            'source_orders': [{
+                'platform_order_id': source_id, 'order_code': 'TX-1',
+                'machine_id': None, 'machine_imei': None, 'machine_name': 'Test machine',
+            }],
+            'sales_orders': [sale],
+        }
+
+        values, totals = run._sales_order_values(
+            warehouse, {recipe_version_id: product}, currency,
+        )
+
+        self.assertEqual(values[0]['source_id'], source_id)
+        self.assertEqual(totals, {recipe_version_id: [2, 800]})
+        with self.assertRaisesRegex(ValidationError, 'appears more than once'):
+            run._sales_order_values(
+                {**warehouse, 'sales_orders': [sale, sale]},
+                {recipe_version_id: product}, currency,
+            )
+
+    def test_contract_three_recipe_cents_match_sum_of_per_order_cents(self):
+        product = self.env['product.product'].create({'name': 'Aggregate cents product'})
+        currency = self.env.company.currency_id
+        source_id = str(uuid.uuid4())
+        recipe_id = str(uuid.uuid4())
+        recipe_version_id = str(uuid.uuid4())
+        line_key = f'{source_id}:1'
+        component = {
+            'odoo_product_id': product.id, 'quantity_per_unit': 1,
+            'total_quantity': 2, 'uom': product.uom_id.name,
+            'stock_quantity_per_unit': 1, 'stock_total_quantity': 2,
+            'stock_uom': product.uom_id.name,
+            'package_content_quantity': None, 'package_content_uom': None,
+        }
+        group = {
+            'odoo_warehouse_id': 7, 'odoo_customer_id': 8,
+            'warehouse_name': 'Test warehouse', 'recipe_id': recipe_id,
+            'recipe_version_id': recipe_version_id, 'version': 1,
+            'name': product.name, 'odoo_finished_product_id': product.id,
+            'units_sold': 2, 'gross_sales': 8.0, 'gross_sales_cents': 800,
+            'currency': currency.name, 'components': [component],
+        }
+        warehouse = {
+            'odoo_warehouse_id': 7, 'odoo_customer_id': 8,
+            'source_orders': [{
+                'platform_order_id': source_id, 'order_code': 'TX-1',
+                'machine_id': None, 'machine_imei': None, 'machine_name': 'Test machine',
+            }],
+            'sales_orders': [{
+                'platform_order_id': source_id, 'platform_line_key': line_key,
+                'source_sha256': 'a' * 64,
+                'recipe_version_id': recipe_version_id, 'order_code': 'TX-1',
+                'order_date': '2026-09-29', 'customer_odoo_id': 8,
+                'currency': currency.name, 'reference': 'TX-1',
+                'expected_total_cents': 800,
+                'lines': [{
+                    'platform_line_key': line_key, 'odoo_product_id': product.id,
+                    'description': product.name, 'quantity': 2, 'gross_cents': 800,
+                }],
+            }],
+            'recipes': [group],
+        }
+        source_id_2 = str(uuid.uuid4())
+        recipe_version_id_2 = str(uuid.uuid4())
+        line_key_2 = f'{source_id_2}:1'
+        warehouse['source_orders'].append({
+            'platform_order_id': source_id_2, 'order_code': 'TX-2',
+            'machine_id': None, 'machine_imei': None, 'machine_name': 'Test machine',
+        })
+        warehouse['sales_orders'].append({
+            'platform_order_id': source_id_2, 'platform_line_key': line_key_2,
+            'source_sha256': 'b' * 64, 'recipe_version_id': recipe_version_id_2,
+            'order_code': 'TX-2', 'order_date': '2026-09-29',
+            'customer_odoo_id': 8, 'currency': currency.name, 'reference': 'TX-2',
+            'expected_total_cents': 300,
+            'lines': [{
+                'platform_line_key': line_key_2, 'odoo_product_id': product.id,
+                'description': product.name, 'quantity': 1, 'gross_cents': 300,
+            }],
+        })
+        warehouse['recipes'].append({
+            **group, 'recipe_version_id': recipe_version_id_2, 'version': 2,
+            'units_sold': 1, 'gross_sales': 3.0, 'gross_sales_cents': 300,
+            'components': [{
+                **component, 'total_quantity': 1, 'stock_total_quantity': 1,
+            }],
+        })
+        run = self.env['softlife.manufacturing.run'].new({
+            'document_date': '2026-09-30',
+            'payload': {'payload_contract_version': 2},
+        })
+        with patch.object(
+                type(run), '_recipe_from_group',
+                return_value={'odoo_finished_product_id': product.id}):
+            run._validate_contract_three_sales([warehouse])
+            warehouse['recipes'][0]['gross_sales'] = 8.01
+            with self.assertRaisesRegex(ValidationError, 'contradicts gross_sales_cents'):
+                run._validate_contract_three_sales([warehouse])
+            warehouse['recipes'][0]['gross_sales'] = 7.99
+            warehouse['recipes'][0]['gross_sales_cents'] = 799
+            with self.assertRaisesRegex(ValidationError, 'do not match'):
+                run._validate_contract_three_sales([warehouse])
+
+    def test_contract_three_rejects_sale_outside_document_month(self):
+        run = self.env['softlife.manufacturing.run'].new({
+            'document_date': '2026-09-30',
+        })
+        product = self.env['product.product'].create({'name': 'Month-bound product'})
+        source_id = str(uuid.uuid4())
+        recipe_version_id = str(uuid.uuid4())
+        line_key = f'{source_id}:1'
+        currency = self.env.company.currency_id
+        warehouse = {
+            'odoo_customer_id': 7,
+            'source_orders': [{
+                'platform_order_id': source_id, 'order_code': 'TX-1',
+                'machine_id': None, 'machine_imei': None, 'machine_name': 'Test machine',
+            }],
+            'sales_orders': [{
+                'platform_order_id': source_id, 'platform_line_key': line_key,
+                'source_sha256': 'a' * 64, 'recipe_version_id': recipe_version_id,
+                'order_code': 'TX-1', 'order_date': '2026-08-31',
+                'customer_odoo_id': 7, 'currency': currency.name,
+                'reference': 'TX-1', 'expected_total_cents': 800,
+                'lines': [{
+                    'platform_line_key': line_key, 'odoo_product_id': product.id,
+                    'description': product.name, 'quantity': 2, 'gross_cents': 800,
+                }],
+            }],
+        }
+
+        with self.assertRaisesRegex(ValidationError, 'invalid header or total'):
+            run._sales_order_values(
+                warehouse, {recipe_version_id: product}, currency,
+            )
+
+    def test_connector_sales_core_fields_are_frozen_for_ordinary_writes(self):
+        warehouse = self.env['stock.warehouse'].search([
+            ('company_id', '=', self.env.company.id),
+        ], limit=1)
+        if not warehouse:
+            self.skipTest('Test company has no warehouse.')
+        partner = self.env['res.partner'].create({'name': 'Frozen sale customer'})
+        other_partner = self.env['res.partner'].create({'name': 'Other customer'})
+        product = self.env['product.product'].create({
+            'name': 'Frozen sale product', 'type': 'service',
+        })
+        source_id = str(uuid.uuid4())
+        with _softlife_manufacturing_internal_scope():
+            sale = self.env['sale.order'].create({
+                'partner_id': partner.id, 'warehouse_id': warehouse.id,
+                'softlife_export_id': str(uuid.uuid4()),
+                'softlife_warehouse_id': warehouse.id,
+                'softlife_sale_key': f'transaction:{source_id}',
+                'softlife_source_order_id': source_id,
+                'softlife_source_payload_sha256': 'a' * 64,
+                'softlife_manufacturing_contract_version': 3,
+                'softlife_document_date': '2026-09-30',
+                'softlife_source_orders': [{'platform_order_id': source_id}],
+                'order_line': [(0, 0, {
+                    'product_id': product.id, 'name': product.name,
+                    'product_uom_qty': 1, 'product_uom': product.uom_id.id,
+                    'price_unit': 1, 'tax_id': [(6, 0, [])],
+                    'softlife_platform_line_key': f'{source_id}:1',
+                })],
+            })
+            sale.action_confirm()
+        line = sale.order_line
+
+        for values in (
+                {'partner_id': other_partner.id}, {'partner_invoice_id': other_partner.id},
+                {'partner_shipping_id': other_partner.id}, {'company_id': self.env.company.id},
+                {'warehouse_id': warehouse.id}, {'currency_id': sale.currency_id.id},
+                {'pricelist_id': sale.pricelist_id.id}, {'date_order': '2026-10-01'},
+                {'state': 'cancel'}, {'client_order_ref': 'changed'}):
+            with self.subTest(values=values), \
+                    self.assertRaisesRegex(UserError, 'fields are frozen'):
+                sale.write(values)
+        for values in (
+                {'softlife_export_id': str(uuid.uuid4())},
+                {'softlife_warehouse_id': warehouse.id}):
+            with self.subTest(values=values), \
+                    self.assertRaisesRegex(ValidationError, 'provenance cannot be changed'):
+                sale.write(values)
+        for values in (
+                {'product_id': product.id}, {'product_uom_qty': 2},
+                {'product_uom': product.uom_id.id}, {'price_unit': 2},
+                {'tax_id': [(6, 0, [])]}, {'name': 'Changed'},
+                {'softlife_rounding_adjustment': True}):
+            with self.subTest(values=values), \
+                    self.assertRaisesRegex(UserError, 'lines are frozen'):
+                line.write(values)
+        with self.assertRaisesRegex(UserError, 'lines are frozen'):
+            self.env['sale.order.line'].create({
+                'order_id': sale.id, 'product_id': product.id,
+                'product_uom_qty': 1, 'product_uom': product.uom_id.id,
+            })
+
+        sale.write({'note': 'Unprotected computed/supporting fields remain writable.'})
+        with _softlife_manufacturing_internal_scope():
+            sale.write({'client_order_ref': 'Connector-authorized update'})
+            line.write({'name': 'Connector-authorized line'})
 
     def test_repeated_rejection_does_not_replace_platform_result(self):
         run = self.env['softlife.manufacturing.run'].create({

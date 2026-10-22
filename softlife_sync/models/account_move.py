@@ -35,10 +35,13 @@ class AccountMove(models.Model):
     softlife_fiscal_invoice_snapshot = fields.Json(
         string='SoftLife Fiscal Invoice Snapshot', copy=False,
     )
+    softlife_fiscal_accounting_key = fields.Char(index=True, copy=False)
 
     _sql_constraints = [
         ('softlife_fiscal_invoice_id_unique', 'unique(softlife_fiscal_invoice_id)',
          'A SoftLife fiscal invoice can only exist once.'),
+        ('softlife_fiscal_accounting_key_unique', 'unique(softlife_fiscal_accounting_key)',
+         'This SoftLife fiscal accounting scope has already been invoiced.'),
         ('softlife_fiscal_provenance_paired',
          "CHECK ((softlife_fiscal_invoice_id IS NULL AND "
          "softlife_fiscal_payload_sha256 IS NULL AND softlife_fiscal_invoice_snapshot IS NULL) OR "
@@ -81,7 +84,7 @@ class AccountMove(models.Model):
     def create(self, vals_list):
         provenance = {
             'softlife_fiscal_invoice_id', 'softlife_fiscal_payload_sha256',
-            'softlife_fiscal_invoice_snapshot',
+            'softlife_fiscal_invoice_snapshot', 'softlife_fiscal_accounting_key',
         }
         if not _softlife_fiscal_is_authorized() and any(
                 provenance.intersection(vals) for vals in vals_list):
@@ -91,7 +94,7 @@ class AccountMove(models.Model):
     def write(self, vals):
         provenance = {
             'softlife_fiscal_invoice_id', 'softlife_fiscal_payload_sha256',
-            'softlife_fiscal_invoice_snapshot',
+            'softlife_fiscal_invoice_snapshot', 'softlife_fiscal_accounting_key',
         }
         protected_draft_fields = {
             'company_id', 'journal_id', 'partner_id', 'move_type', 'currency_id',
@@ -127,9 +130,45 @@ class AccountMove(models.Model):
 class AccountMoveLine(models.Model):
     _inherit = 'account.move.line'
 
+    softlife_fiscal_source_order_id = fields.Char(index=True, copy=False)
+    softlife_fiscal_allocation_id = fields.Char(index=True, copy=False)
+    softlife_supporting_sale_order_id = fields.Char(index=True, copy=False)
+    softlife_supporting_source_sha256 = fields.Char(copy=False)
+
+    _sql_constraints = [
+        ('softlife_fiscal_source_order_unique', 'unique(softlife_fiscal_source_order_id)',
+         'This SoftLife source transaction has already been invoiced.'),
+        ('softlife_fiscal_source_order_id_format',
+         "CHECK (softlife_fiscal_source_order_id IS NULL OR softlife_fiscal_source_order_id ~ "
+         "'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')",
+         'The SoftLife fiscal source transaction ID must be a canonical UUID.'),
+        ('softlife_fiscal_allocation_unique', 'unique(softlife_fiscal_allocation_id)',
+         'This SoftLife fiscal allocation has already been invoiced.'),
+        ('softlife_fiscal_allocation_id_format',
+         "CHECK (softlife_fiscal_allocation_id IS NULL OR softlife_fiscal_allocation_id ~ "
+         "'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')",
+         'The SoftLife fiscal allocation ID must be a canonical UUID.'),
+        ('softlife_supporting_sale_order_id_format',
+         "CHECK (softlife_supporting_sale_order_id IS NULL OR softlife_supporting_sale_order_id ~ "
+         "'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')",
+         'The SoftLife supporting sale-order ID must be a canonical UUID.'),
+        ('softlife_supporting_sale_order_unique', 'unique(softlife_supporting_sale_order_id)',
+         'This SoftLife supporting sales-order document has already been allocated.'),
+        ('softlife_supporting_source_sha256_format',
+         "CHECK (softlife_supporting_source_sha256 IS NULL OR "
+         "softlife_supporting_source_sha256 ~ '^[0-9a-f]{64}$')",
+         'The SoftLife supporting sales-order source hash must be lowercase SHA-256.'),
+    ]
+
     @api.model_create_multi
     def create(self, vals_list):
+        provenance = {
+            'softlife_fiscal_source_order_id', 'softlife_fiscal_allocation_id',
+            'softlife_supporting_sale_order_id', 'softlife_supporting_source_sha256',
+        }
         if not _softlife_fiscal_is_authorized():
+            if any(provenance.intersection(vals) for vals in vals_list):
+                raise UserError(_('SoftLife fiscal source identity is managed internally.'))
             move_ids = {vals.get('move_id') for vals in vals_list if vals.get('move_id')}
             if self.env['account.move'].browse(move_ids).filtered('softlife_fiscal_invoice_id'):
                 raise UserError(_('SoftLife fiscal invoice lines are frozen.'))
@@ -137,6 +176,11 @@ class AccountMoveLine(models.Model):
 
     def write(self, vals):
         if not _softlife_fiscal_is_authorized():
+            if {
+                'softlife_fiscal_source_order_id', 'softlife_fiscal_allocation_id',
+                'softlife_supporting_sale_order_id', 'softlife_supporting_source_sha256',
+            }.intersection(vals):
+                raise UserError(_('SoftLife fiscal source identity cannot be changed.'))
             fiscal_lines = self.filtered(lambda line: line.move_id.softlife_fiscal_invoice_id)
             target_move = self.env['account.move'].browse(vals.get('move_id')).exists()
             if fiscal_lines or target_move.filtered('softlife_fiscal_invoice_id'):
