@@ -6,3 +6,4 @@ from . import test_sync_requests
 from . import test_fiscal_configuration
 from . import test_fiscal_product_remediation
 from . import test_fiscal_invoices
+from . import test_payout_self_billing

@@ -19,7 +19,8 @@ class TestSyncRequests(TransactionCase):
             {'request': {'id': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264', 'claim_token': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3', 'kind': 'stock_snapshot'}},
             {'request': {'status': 'completed'}},
         ]) as api, patch.object(Client, 'sync_all', return_value='Synced all warehouse stock.'), \
-                patch.object(Client, '_acquire_sync_lock', return_value=True), \
+                patch.object(Client, '_acquire_request_lock', return_value=True), \
+                patch.object(Client, '_release_request_lock'), \
                 patch.object(type(self.client.env.cr), 'commit') as commit:
             commit.side_effect = lambda: committed_pending.append(
                 self.env['ir.config_parameter'].sudo().get_param(
@@ -45,7 +46,8 @@ class TestSyncRequests(TransactionCase):
             {'request': {'id': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3', 'claim_token': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264', 'kind': 'stock_snapshot'}},
             {'request': {'status': 'failed'}},
         ]), patch.object(Client, 'sync_all', return_value=summary), \
-                patch.object(Client, '_acquire_sync_lock', return_value=True), \
+                patch.object(Client, '_acquire_request_lock', return_value=True), \
+                patch.object(Client, '_release_request_lock'), \
                 patch.object(type(self.client.env.cr), 'commit'):
             result = self.client.process_platform_sync_request()
 
@@ -59,7 +61,8 @@ class TestSyncRequests(TransactionCase):
             {'request': {'id': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3', 'claim_token': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264', 'kind': 'stock_snapshot'}},
             {'request': {'status': 'completed'}},
         ]), patch.object(Client, 'sync_all', return_value=summary), \
-                patch.object(Client, '_acquire_sync_lock', return_value=True), \
+                patch.object(Client, '_acquire_request_lock', return_value=True), \
+                patch.object(Client, '_release_request_lock'), \
                 patch.object(type(self.client.env.cr), 'commit'):
             result = self.client.process_platform_sync_request()
 
@@ -173,6 +176,49 @@ class TestSyncRequests(TransactionCase):
             })
         self.assertEqual(result['contract_version'], 2)
         create.assert_called_once_with(payload)
+
+    def test_dispatches_all_payout_self_bill_kinds_with_frozen_hashes(self):
+        Client = type(self.client)
+        payload = {'schema_version': 1, 'bill': {}}
+        payload_hash = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(',', ':'),
+        ).encode()).hexdigest()
+        request = {
+            'id': 'd58e68dd-21a6-4a55-8cf4-d7a26bba1264',
+            'claim_token': '7cbd854e-3f88-4ca3-b86b-a4853adffbd3',
+            'payload': payload, 'payload_sha256': payload_hash,
+        }
+        with patch.object(Client, '_create_payout_vendor_bill_draft', return_value={
+                'accepted': True, 'bill': {'state': 'draft'}}) as draft, \
+                patch.object(Client, '_post_payout_vendor_bill', return_value={
+                    'accepted': True, 'bill': {'state': 'posted'}}) as post, \
+                patch.object(Client, '_export_payout_vendor_bill_pdf', return_value={
+                    'accepted': True, 'bill': {'state': 'posted'}}) as pdf:
+            draft_result = self.client._dispatch_platform_sync_request({
+                **request, 'kind': 'payout_vendor_bill_draft_creation',
+            })
+            post_result = self.client._dispatch_platform_sync_request({
+                **request, 'kind': 'payout_vendor_bill_posting',
+            })
+            pdf_result = self.client._dispatch_platform_sync_request({
+                **request, 'kind': 'payout_vendor_bill_pdf_export',
+            })
+        self.assertEqual(draft_result['bill']['state'], 'draft')
+        self.assertEqual(post_result['bill']['state'], 'posted')
+        self.assertEqual(pdf_result['bill']['state'], 'posted')
+        draft.assert_called_once_with(payload, payload_hash)
+        post.assert_called_once_with(payload)
+        pdf.assert_called_once_with(payload, {**request, 'kind': 'payout_vendor_bill_pdf_export'})
+
+    def test_rejects_payout_hash_mismatch_before_handler(self):
+        Client = type(self.client)
+        with patch.object(Client, '_create_payout_vendor_bill_draft') as draft:
+            result = self.client._dispatch_platform_sync_request({
+                'kind': 'payout_vendor_bill_draft_creation',
+                'payload': {'schema_version': 1}, 'payload_sha256': '0' * 64,
+            })
+        self.assertFalse(result['accepted'])
+        draft.assert_not_called()
 
     def test_dispatches_fiscal_sale_links_without_a_hash(self):
         Client = type(self.client)

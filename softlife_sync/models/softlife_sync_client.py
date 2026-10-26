@@ -1974,6 +1974,19 @@ class SoftlifeSyncClient(models.TransientModel):
         return bool(self.env.cr.fetchone()[0])
 
     @api.model
+    def _acquire_request_lock(self):
+        self.env.cr.execute('SELECT pg_try_advisory_lock(%s)', [self._sync_lock_id])
+        return bool(self.env.cr.fetchone()[0])
+
+    @api.model
+    def _release_request_lock(self):
+        try:
+            self.env.cr.execute('SELECT pg_advisory_unlock(%s)', [self._sync_lock_id])
+        except Exception:
+            self.env.cr.rollback()
+            self.env.cr.execute('SELECT pg_advisory_unlock(%s)', [self._sync_lock_id])
+
+    @api.model
     def sync_partners(self):
         rows = self._rest_get('tenants', {'select': 'id,name,kind'})
         Partner = self.env['res.partner']
@@ -1985,6 +1998,10 @@ class SoftlifeSyncClient(models.TransientModel):
             vals = {'name': row.get('name') or 'SoftLife tenant', 'supabase_id': sid, 'is_company': True}
             existing = Partner.search([('supabase_id', '=', sid)], limit=1)
             if existing:
+                if self.env['account.move'].sudo().search_count([
+                    ('partner_id', '=', existing.id), ('softlife_payout_bill_id', '!=', False),
+                ]):
+                    vals.pop('name')
                 existing.write(vals)
             else:
                 Partner.create(vals)
@@ -2691,40 +2708,47 @@ class SoftlifeSyncClient(models.TransientModel):
 
     @api.model
     def process_platform_sync_request(self):
-        pending_result = self._retry_pending_platform_sync_result()
-        if pending_result:
-            return pending_result
-        if not self._acquire_sync_lock():
+        if not self._acquire_request_lock():
             return False
-        claimed = self._api_request('GET', '/api/internal/odoo/sync-requests')
-        request = claimed.get('request')
-        if not request:
-            return False
-        request_id = str(request.get('id') or '')
-        claim_token = str(request.get('claim_token') or '')
-        if not request_id or not claim_token:
-            raise SoftlifeAPIError(_('Platform sync request omitted its ID or lease.'), code='invalid_response')
         try:
-            result = self._dispatch_platform_sync_request(request)
-            result.update({
-                'claim_token': claim_token,
-                'error': None if result['accepted'] else result.get('error') or result['summary'],
-                'finished_at': fields.Datetime.now().isoformat() + 'Z',
-            })
-        except Exception as exc:
-            self.env.cr.rollback()
-            self.env.cr.execute('SELECT pg_advisory_xact_lock(%s)', [self._sync_lock_id])
-            _logger.exception('SoftLife platform-requested sync %s failed', request_id)
-            result = {
-                'accepted': False, 'summary': 'Platform-requested Odoo operation failed.', 'claim_token': claim_token,
-                'error': str(exc), 'finished_at': fields.Datetime.now().isoformat() + 'Z',
-            }
-        pending = {'request_id': request_id, 'result': result}
-        self.env['ir.config_parameter'].sudo().set_param(
-            self._pending_sync_result_key, json.dumps(pending),
-        )
-        self.env.cr.commit()
-        return self._retry_pending_platform_sync_result()
+            pending_result = self._retry_pending_platform_sync_result()
+            if pending_result:
+                return pending_result
+            claimed = self._api_request('GET', '/api/internal/odoo/sync-requests')
+            request = claimed.get('request')
+            if not request:
+                return False
+            request_id = str(request.get('id') or '')
+            claim_token = str(request.get('claim_token') or '')
+            if not request_id or not claim_token:
+                raise SoftlifeAPIError(
+                    _('Platform sync request omitted its ID or lease.'), code='invalid_response',
+                )
+            try:
+                result = self._dispatch_platform_sync_request(request)
+                result.update({
+                    'claim_token': claim_token,
+                    'error': None if result['accepted'] else result.get('error') or result['summary'],
+                    'finished_at': fields.Datetime.now().isoformat() + 'Z',
+                })
+            except Exception as exc:
+                self.env.cr.rollback()
+                _logger.exception('SoftLife platform-requested sync %s failed', request_id)
+                result = {
+                    'accepted': False,
+                    'summary': 'Platform-requested Odoo operation failed.',
+                    'claim_token': claim_token,
+                    'error': str(exc),
+                    'finished_at': fields.Datetime.now().isoformat() + 'Z',
+                }
+            pending = {'request_id': request_id, 'result': result}
+            self.env['ir.config_parameter'].sudo().set_param(
+                self._pending_sync_result_key, json.dumps(pending),
+            )
+            self.env.cr.commit()
+            return self._retry_pending_platform_sync_result()
+        finally:
+            self._release_request_lock()
 
     @api.model
     def _dispatch_platform_sync_request(self, request):
@@ -2737,6 +2761,11 @@ class SoftlifeSyncClient(models.TransientModel):
             'fiscal_product_remediation': self.remediate_fiscal_products,
             'fiscal_invoice_draft_creation': self._create_fiscal_invoice_drafts,
             'fiscal_invoice_bulk_confirmation': self._confirm_fiscal_invoices,
+        }
+        payout_kinds = {
+            'payout_vendor_bill_draft_creation',
+            'payout_vendor_bill_posting',
+            'payout_vendor_bill_pdf_export',
         }
         if kind == 'fiscal_invoice_sale_link':
             return self._link_fiscal_invoices_to_sales(request.get('payload'))
@@ -2754,6 +2783,24 @@ class SoftlifeSyncClient(models.TransientModel):
                     'error': _('Fiscal operation payload hash mismatch.'),
                 }
             return fiscal_handlers[kind](payload)
+        if kind in payout_kinds:
+            payload = request.get('payload')
+            payload_hash = request.get('payload_sha256')
+            if (
+                not isinstance(payload_hash, str)
+                or not re.fullmatch(r'[0-9a-f]{64}', payload_hash)
+                or self._canonical_sha256(payload) != payload_hash
+            ):
+                return {
+                    'accepted': False,
+                    'summary': _('Rejected payout operation with an invalid frozen payload hash.'),
+                    'error': _('Payout operation payload hash mismatch.'),
+                }
+            if kind == 'payout_vendor_bill_draft_creation':
+                return self._create_payout_vendor_bill_draft(payload, payload_hash)
+            if kind == 'payout_vendor_bill_posting':
+                return self._post_payout_vendor_bill(payload)
+            return self._export_payout_vendor_bill_pdf(payload, request)
         return {
             'accepted': False,
             'summary': _('Rejected unsupported platform request kind: %s') % (kind or '<missing>'),
