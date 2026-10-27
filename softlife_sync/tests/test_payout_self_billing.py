@@ -146,6 +146,18 @@ class TestPayoutSelfBilling(TransactionCase):
         self.assertEqual((configured_company, configured_journal, configured_account, configured_tax),
                          (company, journal, account, tax))
 
+    def test_draft_accepts_incomplete_customer_supplied_vendor_details(self):
+        _company, _journal, _account, _tax, payload, _payload_hash = \
+            self._configuration_and_payload()
+        payload['bill']['vendor'].update({
+            'address_line_1': '', 'postal_code': '', 'city': '',
+            'province': '', 'country_code': '',
+        })
+
+        bill, *_ = self.client._validate_payout_draft_payload(payload, self._hash(payload))
+
+        self.assertEqual(bill['vendor']['address_line_1'], '')
+
     def test_creates_exact_draft_and_reuses_it(self):
         company, journal, account, tax, payload, payload_hash = \
             self._configuration_and_payload()

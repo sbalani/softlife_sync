@@ -187,23 +187,20 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
         }
         if not isinstance(vendor, dict) or set(vendor) != expected_fields:
             self._payout_error(_('Payout vendor fields are invalid.'))
-        required = expected_fields - {'address_line_2'}
         if (
-            any(not isinstance(vendor[name], str) or not vendor[name].strip() for name in required)
+            any(not isinstance(vendor[name], str) for name in expected_fields - {'address_line_2'})
             or vendor['address_line_2'] is not None
             and not isinstance(vendor['address_line_2'], str)
-            or vendor['country_code'] != 'ES'
-            or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', vendor['email'])
         ):
-            self._payout_error(_('Payout vendor legal identity is invalid.'))
+            self._payout_error(_('Payout vendor snapshot types are invalid.'))
         limits = {
             'legal_name': 200, 'tax_id': 50, 'email': 254, 'address_line_1': 300,
             'address_line_2': 300, 'postal_code': 20, 'city': 100,
-            'province': 100, 'country_code': 2,
+            'province': 100, 'country_code': 100,
         }
         if any(vendor[name] is not None and len(vendor[name]) > limit
                for name, limit in limits.items()):
-            self._payout_error(_('Payout vendor legal identity is invalid.'))
+            self._payout_error(_('Payout vendor snapshot values are too long.'))
         partners = self.env['res.partner'].sudo().with_context(active_test=False).search([
             ('supabase_id', '=', bill['tenant_id']),
         ])
@@ -236,23 +233,11 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
                 'legal_name', 'tax_id', 'email', 'address_line_1', 'address_line_2',
                 'postal_code', 'city', 'province', 'country_code'}:
             self._payout_error(_('Stored payout vendor identity is invalid.'))
-        actual = {
-            'legal_name': partner.name, 'tax_id': partner.vat or '',
-            'email': partner.email or '', 'address_line_1': partner.street or '',
-            'address_line_2': partner.street2 or None, 'postal_code': partner.zip or '',
-            'city': partner.city or '', 'province': vendor['province'],
-            'country_code': partner.country_id.code or '',
-        }
         if (
-            actual != vendor
-            or self._normalized_place(vendor['province']) not in {
-                self._normalized_place(partner.state_id.name),
-                self._normalized_place(partner.state_id.code),
-            }
-            or partner.supabase_id != bill['tenant_id']
+            partner.supabase_id != bill['tenant_id']
             or not partner.active or partner.company_type != 'company'
         ):
-            self._payout_error(_('Payout vendor does not match the frozen legal identity.'))
+            self._payout_error(_('Payout vendor does not match the tenant identity.'))
 
     @api.model
     def _validate_payout_draft_payload(self, payload, payload_sha256):
