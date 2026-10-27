@@ -133,6 +133,19 @@ class TestPayoutSelfBilling(TransactionCase):
         self.assertEqual(configured[0], company)
         self.assertEqual(configured[3], tax)
 
+    def test_draft_accepts_explicitly_missing_contract_acceptance(self):
+        company, journal, account, tax, payload, payload_hash = \
+            self._configuration_and_payload()
+        payload['bill']['contract_acceptance_id'] = None
+        payload_hash = self._hash(payload)
+
+        bill, configured_company, configured_journal, configured_account, configured_tax, _, _ = \
+            self.client._validate_payout_draft_payload(payload, payload_hash)
+
+        self.assertIsNone(bill['contract_acceptance_id'])
+        self.assertEqual((configured_company, configured_journal, configured_account, configured_tax),
+                         (company, journal, account, tax))
+
     def test_creates_exact_draft_and_reuses_it(self):
         company, journal, account, tax, payload, payload_hash = \
             self._configuration_and_payload()

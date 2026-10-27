@@ -271,7 +271,9 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
         if not isinstance(bill, dict) or set(bill) != expected:
             self._payout_error(_('Payout self-bill fields are invalid.'))
         if any(not self._canonical_uuid(bill.get(name)) for name in (
-                'platform_bill_id', 'settlement_id', 'tenant_id', 'contract_acceptance_id')):
+                'platform_bill_id', 'settlement_id', 'tenant_id')) \
+                or bill.get('contract_acceptance_id') is not None \
+                and not self._canonical_uuid(bill['contract_acceptance_id']):
             self._payout_error(_('Payout self-bill identity is invalid.'))
         try:
             month_start = datetime.date.fromisoformat(str(bill.get('period_month')) + '-01')
