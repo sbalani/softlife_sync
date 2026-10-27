@@ -10,7 +10,6 @@ from odoo import Command, _, api, fields, models
 
 from .account_move import _softlife_payout_internal_scope
 from .locks import softlife_company_month_advisory_lock
-from .res_partner import _softlife_payout_partner_internal_scope
 from .softlife_sync_client import SoftlifeAPIError
 
 
@@ -77,30 +76,82 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
         ).casefold().strip()
 
     @api.model
-    def _payout_configuration(self):
-        names = ('company_id', 'purchase_journal_id', 'expense_product_id', 'purchase_tax_id')
-        values = {}
-        for name in names:
-            try:
-                values[name] = int(self._param(f'softlife.sync.payout_{name}'))
-            except (TypeError, ValueError):
-                self._payout_error(_('Payout self-billing configuration is incomplete.'))
-        company = self.env['res.company'].sudo().browse(values['company_id']).exists()
-        journal = self.env['account.journal'].sudo().with_context(active_test=False).browse(
-            values['purchase_journal_id']
-        ).exists()
-        product = self.env['product.product'].sudo().with_context(active_test=False).browse(
-            values['expense_product_id']
-        ).exists()
-        tax = self.env['account.tax'].sudo().with_context(active_test=False).browse(
-            values['purchase_tax_id']
-        ).exists()
-        if not all((company, journal, product, tax)):
-            self._payout_error(_('Payout self-billing configuration is incomplete.'))
-        account = product.with_company(company).product_tmpl_id.get_product_accounts().get('expense')
-        supplier_taxes = product.with_company(company).supplier_taxes_id._filter_taxes_by_company(
-            company
+    def _payout_account_allowed(self, account, journal, company):
+        journal_control_exempt = journal.default_account_id
+        if 'suspense_account_id' in journal._fields:
+            journal_control_exempt |= journal.suspense_account_id
+        return bool(
+            account
+            and self._account_applies_to_company(account, company)
+            and not ('deprecated' in account._fields and account.deprecated)
+            and (not account.currency_id or account.currency_id == company.currency_id)
+        ) and not (
+            'allowed_journal_ids' in account._fields and account.allowed_journal_ids
+            and journal not in account.allowed_journal_ids
+        ) and not (
+            'account_control_ids' in journal._fields and journal.account_control_ids
+            and account not in journal.account_control_ids
+            and account not in journal_control_exempt
         )
+
+    @api.model
+    def _payout_configuration(self, configured_company=None):
+        journal_domain = [('code', '=', 'AFRS'), ('type', '=', 'purchase')]
+        if configured_company:
+            configured_company_id = configured_company.id
+        else:
+            try:
+                configured_company_id = int(self._param('softlife.sync.fiscal_company_id'))
+            except (TypeError, ValueError):
+                configured_company_id = 0
+        if configured_company_id:
+            journal_domain.append(('company_id', '=', configured_company_id))
+        journals = self.env['account.journal'].sudo().with_context(active_test=False).search(
+            journal_domain
+        )
+        if len(journals) != 1 or not journals.active:
+            self._payout_error(_(
+                'Odoo must contain exactly one active AFRS purchase journal.'
+            ))
+        journal = journals
+        company = journal.company_id
+        Account = self.env['account.account'].sudo().with_company(company).with_context(
+            active_test=False, allowed_company_ids=[company.id]
+        )
+        account_domain = [
+            ('code', '=', '623100'), ('account_type', 'in', ('expense', 'expense_direct_cost')),
+        ]
+        if 'company_ids' in Account._fields:
+            account_domain.append(('company_ids', 'in', [company.id]))
+        elif 'company_id' in Account._fields:
+            account_domain.append(('company_id', 'in', [False, company.id]))
+        accounts = Account.search(account_domain).filtered(
+            lambda candidate: self._account_applies_to_company(candidate, company)
+        )
+        if len(accounts) != 1:
+            self._payout_error(_(
+                'Odoo must contain exactly one expense account 623100 for the AFRS company.'
+            ))
+        account = accounts
+        tax_candidates = self.env['account.tax'].sudo().with_company(company).with_context(
+            active_test=False, allowed_company_ids=[company.id]
+        ).search([
+            ('company_id', '=', company.id), ('active', '=', True),
+            ('type_tax_use', '=', 'purchase'), ('amount_type', '=', 'percent'),
+            ('amount', '=', 21), ('country_id', '=', company.account_fiscal_country_id.id),
+            ('tax_exigibility', '=', 'on_invoice'),
+        ]).filtered(lambda candidate: not candidate.price_include)
+        taxes_used = self.env['account.move'].sudo().search([
+            ('journal_id', '=', journal.id), ('move_type', '=', 'in_invoice'),
+            ('state', 'in', ('draft', 'posted')),
+        ]).invoice_line_ids.filtered(
+            lambda line: line.display_type == 'product' and line.account_id == account
+        ).tax_ids & tax_candidates
+        tax = taxes_used if len(taxes_used) == 1 else tax_candidates
+        if len(tax) != 1:
+            self._payout_error(_(
+                'Odoo must identify exactly one excluded 21% purchase IVA tax for AFRS bills.'
+            ))
         repartition = tax.invoice_repartition_line_ids
         base_repartition = repartition.filtered(lambda line: line.repartition_type == 'base')
         tax_repartition = repartition.filtered(lambda line: line.repartition_type == 'tax')
@@ -109,7 +160,7 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
             and sum(tax_repartition.mapped('factor_percent')) == 100
             and tax_repartition
             and all(line.account_id and line.account_id.account_type == 'asset_current'
-                    and self._account_applies_to_company(line.account_id, company)
+                    and self._payout_account_allowed(line.account_id, journal, company)
                     for line in tax_repartition)
             and any(line.tag_ids for line in base_repartition)
             and any(line.tag_ids for line in tax_repartition)
@@ -119,23 +170,22 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
             or not company.account_fiscal_country_id
             or company.account_fiscal_country_id.code != 'ES'
             or not journal.active or journal.company_id != company or journal.type != 'purchase'
-            or not product.active or not product.purchase_ok
-            or not account or account.account_type not in ('expense', 'expense_direct_cost')
-            or not self._account_applies_to_company(account, company)
-            or supplier_taxes != tax or not tax.active or tax.company_id != company
+            or ('is_self_billing' in journal._fields and not journal.is_self_billing)
+            or not self._payout_account_allowed(account, journal, company)
+            or not tax.active or tax.company_id != company
             or tax.type_tax_use != 'purchase' or tax.amount_type != 'percent'
-            or tax.amount != 21 or not tax.price_include
+            or tax.amount != 21 or tax.price_include
             or tax.country_id != company.account_fiscal_country_id
             or tax.tax_exigibility != 'on_invoice' or not valid_repartition
         ):
             self._payout_error(_(
-                'Payout self-billing configuration must use the selected Spanish EUR company, '
-                'purchase journal, expense product, and price-included 21% purchase tax.'
+                'The AFRS journal must use a Spanish EUR company, an unrestricted active account '
+                '623100, and a valid excluded 21% purchase IVA tax.'
             ))
-        return company, journal, product, account, tax
+        return company, journal, account, tax
 
     @api.model
-    def _prepare_payout_vendor(self, bill, company):
+    def _prepare_payout_vendor(self, bill, company, journal):
         vendor = bill.get('vendor')
         expected_fields = {
             'legal_name', 'tax_id', 'email', 'address_line_1', 'address_line_2',
@@ -160,51 +210,28 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
         if any(vendor[name] is not None and len(vendor[name]) > limit
                for name, limit in limits.items()):
             self._payout_error(_('Payout vendor legal identity is invalid.'))
-        country = self.env['res.country'].sudo().search([('code', '=', vendor['country_code'])])
-        if len(country) != 1:
-            self._payout_error(_('Payout vendor country is not uniquely configured in Odoo.'))
-        province = self._normalized_place(vendor['province'])
-        states = self.env['res.country.state'].sudo().search([
-            ('country_id', '=', country.id),
-        ]).filtered(lambda state: province in {
-            self._normalized_place(state.name), self._normalized_place(state.code),
-        })
-        if len(states) != 1:
-            self._payout_error(_('Payout vendor province is not uniquely configured in Odoo.'))
-        base_partners = self.env['res.partner'].sudo().with_context(active_test=False).search([
+        partners = self.env['res.partner'].sudo().with_context(active_test=False).search([
             ('supabase_id', '=', bill['tenant_id']),
         ])
-        if len(base_partners) > 1:
-            self._payout_error(_('Payout vendor supabase_id is not unique in Odoo.'))
-        with _softlife_payout_partner_internal_scope():
-            if not base_partners:
-                base_partners = self.env['res.partner'].sudo().create({
-                    'name': vendor['legal_name'], 'supabase_id': bill['tenant_id'],
-                    'is_company': True,
-                })
-        vendor_hash = self._canonical_sha256(vendor)
-        vendor_key = f'{bill["tenant_id"]}:{vendor_hash}'
-        partners = self.env['res.partner'].sudo().with_context(active_test=False).search([
-            ('softlife_payout_vendor_key', '=', vendor_key),
-        ])
-        if len(partners) > 1:
-            self._payout_error(_('Payout vendor snapshot identity is not unique in Odoo.'))
-        values = {
-            'name': vendor['legal_name'], 'vat': vendor['tax_id'], 'email': vendor['email'],
-            'street': vendor['address_line_1'], 'street2': vendor['address_line_2'] or False,
-            'zip': vendor['postal_code'], 'city': vendor['city'], 'state_id': states.id,
-            'country_id': country.id, 'supplier_rank': 1, 'company_id': company.id,
-            'active': True, 'company_type': 'company',
-            'softlife_payout_tenant_id': bill['tenant_id'],
-            'softlife_payout_vendor_sha256': vendor_hash,
-            'softlife_payout_vendor_key': vendor_key,
-        }
+        if len(partners) != 1:
+            self._payout_error(_(
+                'The payout vendor must already exist exactly once with the tenant supabase_id.'
+            ))
         partner = partners
         if partner and partner.company_id and partner.company_id != company:
             self._payout_error(_('Payout vendor belongs to another Odoo company.'))
-        with _softlife_payout_partner_internal_scope():
-            if not partner:
-                partner = self.env['res.partner'].sudo().with_company(company).create(values)
+        company_partner = partner.with_company(company)
+        payable_account = company_partner.property_account_payable_id
+        fiscal_position = self.env['account.fiscal.position'].sudo().with_company(
+            company
+        )._get_fiscal_position(company_partner)
+        if fiscal_position:
+            payable_account = fiscal_position.map_account(payable_account)
+        if (
+            payable_account.account_type != 'liability_payable'
+            or not self._payout_account_allowed(payable_account, journal, company)
+        ):
+            self._payout_error(_('Payout vendor has no valid payable account for the AFRS journal.'))
         self._validate_payout_vendor_identity(partner, bill)
         return partner
 
@@ -228,11 +255,7 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
                 self._normalized_place(partner.state_id.name),
                 self._normalized_place(partner.state_id.code),
             }
-            or partner.softlife_payout_tenant_id != bill['tenant_id']
-            or partner.softlife_payout_vendor_sha256 != self._canonical_sha256(vendor)
-            or partner.softlife_payout_vendor_key != (
-                f'{bill["tenant_id"]}:{self._canonical_sha256(vendor)}'
-            ) or not partner.supplier_rank
+            or partner.supabase_id != bill['tenant_id']
             or not partner.active or partner.company_type != 'company'
         ):
             self._payout_error(_('Payout vendor does not match the frozen legal identity.'))
@@ -259,20 +282,19 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
         try:
             month_start = datetime.date.fromisoformat(str(bill.get('period_month')) + '-01')
             next_month = (month_start.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
-            month_end = next_month - datetime.timedelta(days=1)
             invoice_date = datetime.date.fromisoformat(str(bill.get('invoice_date')))
         except (TypeError, ValueError):
             self._payout_error(_('Payout self-bill invoice date is invalid.'))
         if (
             not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', str(bill.get('period_month')))
-            or invoice_date != month_end or bill['invoice_date'] != month_end.isoformat()
+            or invoice_date != next_month or bill['invoice_date'] != next_month.isoformat()
             or bill.get('currency') != 'EUR' or bill.get('move_type') != 'in_invoice'
             or not isinstance(bill.get('reference'), str) or not bill['reference'].strip()
             or len(bill['reference']) > 200
             or bill['reference'] != f'AUTOFAC-{bill["period_month"]}-{bill["tenant_id"]}'
             or not isinstance(bill.get('description'), str)
             or 'facturación por el destinatario' not in bill['description']
-            or bill.get('contract_version') != 'SL-GESTOR-2026-10-26-v3'
+            or bill.get('contract_version') != 'SL-GESTOR-2026-10-27-v4'
             or not re.fullmatch(r'[0-9a-f]{64}', str(bill.get('source_snapshot_sha256') or ''))
             or not self._positive_int(bill.get('gross_cents'))
             or not self._nonnegative_int(bill.get('tax_base_cents'))
@@ -281,18 +303,18 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
             or isinstance(bill.get('iva_rate_percent'), bool)
         ):
             self._payout_error(_('Payout self-bill values are invalid.'))
-        computed_base = (Decimal(bill['gross_cents']) * Decimal(100) / Decimal(121)).quantize(
+        computed_iva = (Decimal(bill['tax_base_cents']) * Decimal(21) / Decimal(100)).quantize(
             Decimal('1'), rounding=ROUND_HALF_UP,
         )
         if (
             bill['tax_base_cents'] + bill['iva_cents'] != bill['gross_cents']
-            or computed_base != bill['tax_base_cents']
-            or bill['gross_cents'] - computed_base != bill['iva_cents']
+            or computed_iva != bill['iva_cents']
         ):
-            self._payout_error(_('Payout self-bill gross-inclusive IVA cents are invalid.'))
-        company, journal, product, account, tax = self._payout_configuration()
+            self._payout_error(_('Payout self-bill tax-base IVA cents are invalid.'))
+        company, journal, account, tax = self._payout_configuration()
         accounting_key = f'payout:{company.id}:{bill["tenant_id"]}:{bill["period_month"]}'
-        return bill, company, journal, product, account, tax, accounting_key
+        due_date = next_month.replace(day=15)
+        return bill, company, journal, account, tax, accounting_key, due_date
 
     @api.model
     def _payout_recipient_snapshot(self, company):
@@ -323,7 +345,7 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
 
     @api.model
     def _validate_payout_move(self, move, bill, payload_sha256, company, journal,
-                              product, account, tax, accounting_key, partner=None):
+                              account, tax, accounting_key, due_date, partner=None):
         partner = partner or move.partner_id
         if (
             move.softlife_payout_bill_id != bill['platform_bill_id']
@@ -339,6 +361,8 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
             or move.currency_id != company.currency_id
             or fields.Date.to_string(move.invoice_date) != bill['invoice_date']
             or fields.Date.to_string(move.date) != bill['invoice_date']
+            or fields.Date.to_string(move.invoice_date_due) != fields.Date.to_string(due_date)
+            or move.invoice_payment_term_id
             or move.ref != bill['reference'] or move.state not in ('draft', 'posted')
             or 'facturación por el destinatario' not in (move.narration or '')
         ):
@@ -355,8 +379,8 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
             self._payout_error(_('Payout self-bill must contain exactly one aggregate line.'))
         line = lines[0]
         if (
-            line.product_id != product or line.name != bill['description'] or line.quantity != 1
-            or abs(line.price_unit - float(Decimal(bill['gross_cents']) / Decimal(100))) > 1e-9
+            line.product_id or line.name != bill['description'] or line.quantity != 1
+            or abs(line.price_unit - float(Decimal(bill['tax_base_cents']) / Decimal(100))) > 1e-9
             or line.account_id != account or line.tax_ids != tax
             or self._amount_cents(line.price_total) != bill['gross_cents']
             or self._amount_cents(line.price_subtotal) != bill['tax_base_cents']
@@ -365,6 +389,14 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
             or self._amount_cents(move.amount_tax) != bill['iva_cents']
         ):
             self._payout_error(_('Payout self-bill accounting amounts do not match frozen cents.'))
+        if move.state == 'posted':
+            payable_lines = move.line_ids.filtered(
+                lambda item: item.account_id.account_type == 'liability_payable'
+            )
+            if not payable_lines or any(
+                    fields.Date.to_string(item.date_maturity) != fields.Date.to_string(due_date)
+                    for item in payable_lines):
+                self._payout_error(_('Payout self-bill payable maturity does not match the due date.'))
 
     @api.model
     def _create_payout_vendor_bill_draft(self, payload, payload_sha256):
@@ -373,7 +405,7 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
                 _('Payout self-bill draft creation is disabled in Odoo Settings.'),
                 code='payout_vendor_bill_draft_creation_disabled',
             )
-        bill, company, journal, product, account, tax, accounting_key = \
+        bill, company, journal, account, tax, accounting_key, due_date = \
             self._validate_payout_draft_payload(payload, payload_sha256)
         invoice_date = fields.Date.to_date(bill['invoice_date'])
         self._assert_payout_date_unlocked(company, journal, invoice_date)
@@ -391,7 +423,7 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
                 existing.softlife_payout_bill_id != bill['platform_bill_id']
                 or existing.softlife_payout_accounting_key != accounting_key):
             self._payout_error(_('Payout self-bill identity conflicts with an existing bill.'))
-        partner = self._prepare_payout_vendor(bill, company)
+        partner = self._prepare_payout_vendor(bill, company, journal)
         recipient, recipient_hash = self._payout_recipient_snapshot(company)
         move = existing
         created = not move
@@ -401,11 +433,12 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
                     'company_id': company.id, 'journal_id': journal.id,
                     'partner_id': partner.id, 'move_type': 'in_invoice',
                     'currency_id': company.currency_id.id, 'date': invoice_date,
-                    'invoice_date': invoice_date, 'ref': bill['reference'],
+                    'invoice_date': invoice_date, 'invoice_payment_term_id': False,
+                    'invoice_date_due': due_date, 'ref': bill['reference'],
                     'narration': bill['description'],
                     'invoice_line_ids': [Command.create({
-                        'product_id': product.id, 'name': bill['description'], 'quantity': 1,
-                        'price_unit': float(Decimal(bill['gross_cents']) / Decimal(100)),
+                        'name': bill['description'], 'quantity': 1,
+                        'price_unit': float(Decimal(bill['tax_base_cents']) / Decimal(100)),
                         'account_id': account.id, 'tax_ids': [Command.set(tax.ids)],
                     })],
                     'softlife_payout_bill_id': bill['platform_bill_id'],
@@ -420,8 +453,8 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
                     'softlife_payout_recipient_sha256': recipient_hash,
                 })
         self._validate_payout_move(
-            move, bill, payload_sha256, company, journal, product, account, tax,
-            accounting_key, partner,
+            move, bill, payload_sha256, company, journal, account, tax,
+            accounting_key, due_date, partner,
         )
         if move.state != 'draft':
             self._payout_error(_('Payout draft creation cannot reuse a posted self-bill.'))
@@ -467,21 +500,23 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
             lines = move.invoice_line_ids.filtered(lambda line: line.display_type == 'product')
             if len(lines) != 1 or not move.name:
                 self._payout_error(_('Posted payout self-bill is structurally inconsistent.'))
-            company, journal, product, account, tax = (
-                move.company_id, move.journal_id, lines.product_id, lines.account_id, lines.tax_ids,
+            company, journal, account, tax = (
+                move.company_id, move.journal_id, lines.account_id, lines.tax_ids,
             )
             accounting_key = move.softlife_payout_accounting_key
+            due_date = fields.Date.to_date(snapshot.get('invoice_date')).replace(day=15)
         else:
-            company, journal, product, account, tax = self._payout_configuration()
+            company, journal, account, tax = self._payout_configuration()
             accounting_key = (
                 f'payout:{company.id}:{snapshot.get("tenant_id")}:{snapshot.get("period_month")}'
             )
             self._assert_payout_date_unlocked(
                 company, journal, fields.Date.to_date(snapshot.get('invoice_date')),
             )
+            due_date = fields.Date.to_date(snapshot.get('invoice_date')).replace(day=15)
         self._validate_payout_move(
-            move, snapshot, bill['payload_sha256'], company, journal, product, account, tax,
-            accounting_key,
+            move, snapshot, bill['payload_sha256'], company, journal, account, tax,
+            accounting_key, due_date,
         )
         posted = move.state == 'draft'
         if posted:
@@ -489,6 +524,13 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
                 move.action_post()
             if fields.Date.to_string(move.date) != snapshot['invoice_date']:
                 self._payout_error(_('Odoo changed the payout self-bill accounting date.'))
+            payable_lines = move.line_ids.filtered(
+                lambda line: line.account_id.account_type == 'liability_payable'
+            )
+            if not payable_lines or any(
+                    fields.Date.to_string(line.date_maturity) != fields.Date.to_string(due_date)
+                    for line in payable_lines):
+                self._payout_error(_('Odoo changed the payout self-bill due date.'))
         return {'accepted': True, 'bill': {
             'platform_bill_id': bill['platform_bill_id'], 'odoo_move_id': move.id,
             'payload_sha256': bill['payload_sha256'], 'state': 'posted',
@@ -497,13 +539,13 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
 
     @api.model
     def _payout_invoice_report(self):
-        report = self.env.ref('softlife_sync.action_report_payout_self_bill', raise_if_not_found=False)
+        report = self.env.ref('account.account_invoices', raise_if_not_found=False)
         if (
             report and report._name == 'ir.actions.report'
             and report.model == 'account.move' and report.report_type == 'qweb-pdf'
         ):
             return report
-        self._payout_error(_('The SoftLife self-billing PDF report is unavailable.'))
+        self._payout_error(_('The standard Odoo invoice PDF report is unavailable.'))
 
     @api.model
     def _export_payout_vendor_bill_pdf(self, payload, request):
@@ -537,8 +579,8 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
             self._payout_error(_('Posted payout self-bill is structurally inconsistent.'))
         self._validate_payout_move(
             move, snapshot, bill['payload_sha256'], move.company_id, move.journal_id,
-            lines.product_id, lines.account_id, lines.tax_ids,
-            move.softlife_payout_accounting_key,
+            lines.account_id, lines.tax_ids, move.softlife_payout_accounting_key,
+            fields.Date.to_date(snapshot.get('invoice_date')).replace(day=15),
         )
         attachments = self.env['ir.attachment'].sudo().search([
             ('softlife_payout_bill_id', '=', bill['platform_bill_id']),

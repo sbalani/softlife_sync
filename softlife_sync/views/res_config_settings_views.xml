@@ -50,7 +50,7 @@
                                 <field name="softlife_fiscal_company_id" options="{'no_create': True}"/>
                             </setting>
                             <setting id="softlife_payout_draft" string="Allow payout self-bill draft creation"
-                                     help="Off by default. Allows validated payout requests to create exact vendor-bill drafts.">
+                                     help="Off by default. Uses the existing AFRS journal, account 623100, excluded 21% purchase IVA, and the vendor mapped by SoftLife ID.">
                                 <field name="softlife_payout_bill_draft_creation_enabled"/>
                             </setting>
                             <setting id="softlife_payout_post" string="Allow payout self-bill posting"
@@ -60,24 +60,6 @@
                             <setting id="softlife_payout_pdf" string="Allow payout self-bill PDF export"
                                      help="Off by default. Renders the posted vendor bill and uploads its raw PDF to the platform.">
                                 <field name="softlife_payout_bill_pdf_export_enabled"/>
-                            </setting>
-                            <setting id="softlife_payout_company" string="Payout self-billing company">
-                                <field name="softlife_payout_company_id" options="{'no_create': True}"/>
-                            </setting>
-                            <setting id="softlife_payout_journal" string="Payout purchase journal">
-                                <field name="softlife_payout_purchase_journal_id"
-                                       domain="[('type', '=', 'purchase'), ('company_id', '=', softlife_payout_company_id)]"
-                                       options="{'no_create': True}"/>
-                            </setting>
-                            <setting id="softlife_payout_product" string="Payout expense product">
-                                <field name="softlife_payout_expense_product_id"
-                                       domain="[('purchase_ok', '=', True)]" options="{'no_create': True}"/>
-                            </setting>
-                            <setting id="softlife_payout_tax" string="Payout purchase IVA"
-                                     help="Must be the product's active, price-included 21% purchase tax.">
-                                <field name="softlife_payout_purchase_tax_id"
-                                       domain="[('type_tax_use', '=', 'purchase'), ('amount_type', '=', 'percent'), ('amount', '=', 21), ('price_include', '=', True), ('company_id', '=', softlife_payout_company_id)]"
-                                       options="{'no_create': True}"/>
                             </setting>
                             <setting id="softlife_last" string="Last sync">
                                 <field name="softlife_last_sync" readonly="1"/>

@@ -1998,10 +1998,6 @@ class SoftlifeSyncClient(models.TransientModel):
             vals = {'name': row.get('name') or 'SoftLife tenant', 'supabase_id': sid, 'is_company': True}
             existing = Partner.search([('supabase_id', '=', sid)], limit=1)
             if existing:
-                if self.env['account.move'].sudo().search_count([
-                    ('partner_id', '=', existing.id), ('softlife_payout_bill_id', '!=', False),
-                ]):
-                    vals.pop('name')
                 existing.write(vals)
             else:
                 Partner.create(vals)

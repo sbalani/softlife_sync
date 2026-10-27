@@ -35,17 +35,43 @@ class TestPayoutSelfBilling(TransactionCase):
             'zip': company.zip or '28001', 'city': company.city or 'Madrid',
             'state_id': company.state_id.id or state.id, 'country_id': country.id,
         })
-        account = self.env['account.account'].with_company(company).search([
+        source_account = self.env['account.account'].with_company(company).search([
             ('account_type', 'in', ('expense', 'expense_direct_cost')),
         ], limit=1)
-        if not account:
+        if not source_account:
             self.skipTest('Test company has no expense account.')
-        journal = self.env['account.journal'].with_company(company).create({
-            'name': 'SoftLife payout self-bill tests', 'code': 'SLPB',
-            'type': 'purchase', 'company_id': company.id,
-        })
-        source_tax = self.env['account.tax'].with_company(company).search([
+        account = self.env['account.account'].with_company(company).search([
+            ('code', '=', '623100'),
+        ]).filtered(lambda candidate: self.client._account_applies_to_company(
+            candidate, company
+        ))
+        if not account:
+            account = source_account.copy({'name': 'Comisiones / Revenue Share Ubicaciones',
+                                           'code': '623100'})
+        journal = self.env['account.journal'].with_company(company).search([
+            ('code', '=', 'AFRS'), ('type', '=', 'purchase'), ('company_id', '=', company.id),
+        ])
+        if not journal:
+            journal = self.env['account.journal'].with_company(company).create({
+                'name': 'Autofacturas - Revenue Share', 'code': 'AFRS',
+                'type': 'purchase', 'company_id': company.id,
+            })
+        if 'is_self_billing' in journal._fields:
+            journal.is_self_billing = True
+        account_values = {'currency_id': False}
+        if 'deprecated' in account._fields:
+            account_values['deprecated'] = False
+        if 'allowed_journal_ids' in account._fields:
+            account_values['allowed_journal_ids'] = [(5, 0, 0)]
+        account.write(account_values)
+        if 'account_control_ids' in journal._fields:
+            journal.account_control_ids = [(5, 0, 0)]
+        self.env['ir.config_parameter'].sudo().set_param(
+            'softlife.sync.fiscal_company_id', company.id
+        )
+        source_taxes = self.env['account.tax'].with_company(company).search([
             ('company_id', '=', company.id), ('country_id', '=', country.id),
+            ('active', '=', True), ('tax_exigibility', '=', 'on_invoice'),
             ('type_tax_use', '=', 'purchase'), ('amount_type', '=', 'percent'),
             ('amount', '=', 21),
         ]).filtered(lambda candidate: (
@@ -56,38 +82,26 @@ class TestPayoutSelfBilling(TransactionCase):
                         lambda row: row.repartition_type == 'tax'))
             and any(line.tag_ids for line in candidate.invoice_repartition_line_ids.filtered(
                 lambda row: row.repartition_type == 'tax'))
-        ))[:1]
-        if not source_tax:
+        ))
+        if not source_taxes:
             self.skipTest('Test company has no fully configured Spanish 21% purchase IVA tax.')
-        tax = source_tax.copy({
-            'name': 'SoftLife payout IVA incluido 21%',
-            'price_include_override': 'tax_included',
+        source_taxes.filtered(lambda candidate: not candidate.price_include).write({'active': False})
+        tax = source_taxes[:1].copy({
+            'name': 'SoftLife payout IVA excluido 21%',
+            'price_include_override': 'tax_excluded',
+            'active': True,
         })
-        category = self.env['product.category'].with_company(company).create({
-            'name': 'SoftLife payout self-bill tests',
-            'property_account_expense_categ_id': account.id,
-        })
-        product = self.env['product.product'].with_company(company).create({
-            'name': 'SoftLife payout management service', 'purchase_ok': True,
-            'sale_ok': False, 'type': 'service', 'categ_id': category.id,
-            'supplier_taxes_id': [(6, 0, tax.ids)],
-        })
-        params = self.env['ir.config_parameter'].sudo()
-        params.set_param('softlife.sync.payout_company_id', company.id)
-        params.set_param('softlife.sync.payout_purchase_journal_id', journal.id)
-        params.set_param('softlife.sync.payout_expense_product_id', product.id)
-        params.set_param('softlife.sync.payout_purchase_tax_id', tax.id)
         bill = {
             'platform_bill_id': str(uuid.uuid4()),
             'settlement_id': str(uuid.uuid4()),
             'tenant_id': str(uuid.uuid4()),
-            'period_month': '2026-09', 'invoice_date': '2026-09-30',
+            'period_month': '2026-09', 'invoice_date': '2026-10-01',
             'currency': 'EUR', 'move_type': 'in_invoice',
             'reference': None,
             'description': 'Servicios de gestión, facturación por el destinatario',
             'gross_cents': 1210, 'tax_base_cents': 1000, 'iva_cents': 210,
             'iva_rate_percent': 21, 'contract_acceptance_id': str(uuid.uuid4()),
-            'contract_version': 'SL-GESTOR-2026-10-26-v3',
+            'contract_version': 'SL-GESTOR-2026-10-27-v4',
             'source_snapshot_sha256': 'a' * 64,
             'vendor': {
                 'legal_name': 'Gestor Payout SL', 'tax_id': 'B99286320',
@@ -96,9 +110,25 @@ class TestPayoutSelfBilling(TransactionCase):
                 'province': state.name.swapcase(), 'country_code': 'ES',
             },
         }
+        partner = self.env['res.partner'].with_context(no_vat_validation=True).create({
+            'name': bill['vendor']['legal_name'], 'vat': bill['vendor']['tax_id'],
+            'email': bill['vendor']['email'], 'street': bill['vendor']['address_line_1'],
+            'zip': bill['vendor']['postal_code'], 'city': bill['vendor']['city'],
+            'state_id': state.id, 'country_id': country.id, 'company_type': 'company',
+            'is_company': True, 'supabase_id': bill['tenant_id'],
+        })
+        controlled_accounts = account | tax.invoice_repartition_line_ids.account_id \
+            | partner.with_company(company).property_account_payable_id
+        for controlled_account in controlled_accounts:
+            values = {'currency_id': False}
+            if 'deprecated' in controlled_account._fields:
+                values['deprecated'] = False
+            if 'allowed_journal_ids' in controlled_account._fields:
+                values['allowed_journal_ids'] = [(5, 0, 0)]
+            controlled_account.write(values)
         bill['reference'] = f'AUTOFAC-{bill["period_month"]}-{bill["tenant_id"]}'
         payload = {'schema_version': 1, 'bill': bill}
-        return company, journal, product, tax, payload, self._hash(payload)
+        return company, journal, account, tax, payload, self._hash(payload)
 
     def _draft(self):
         records = self._configuration_and_payload()
@@ -109,7 +139,7 @@ class TestPayoutSelfBilling(TransactionCase):
         return (*records, result)
 
     def test_creates_exact_draft_and_reuses_it(self):
-        company, journal, product, tax, payload, payload_hash = \
+        company, journal, account, tax, payload, payload_hash = \
             self._configuration_and_payload()
         Client = type(self.client)
         with patch.object(Client, '_payout_enabled', return_value=True), \
@@ -124,43 +154,51 @@ class TestPayoutSelfBilling(TransactionCase):
         })
         self.assertTrue(first['bill']['created'])
         self.assertFalse(second['bill']['created'])
+        self.assertEqual(self.env['res.partner'].search_count([
+            ('supabase_id', '=', payload['bill']['tenant_id']),
+        ]), 1)
         move = self.env['account.move'].browse(first['bill']['odoo_move_id'])
         self.assertEqual(move.state, 'draft')
         self.assertEqual(move.move_type, 'in_invoice')
         self.assertEqual(move.journal_id, journal)
-        self.assertEqual(move.invoice_line_ids.product_id, product)
+        self.assertFalse(move.invoice_line_ids.product_id)
+        self.assertEqual(move.invoice_line_ids.account_id, account)
         self.assertEqual(move.invoice_line_ids.tax_ids, tax)
-        self.assertEqual(move.invoice_line_ids.price_unit, 12.10)
+        self.assertEqual(move.invoice_line_ids.price_unit, 10.00)
         self.assertEqual(self.client._amount_cents(move.amount_total), 1210)
         self.assertEqual(self.client._amount_cents(move.amount_untaxed), 1000)
         self.assertEqual(self.client._amount_cents(move.amount_tax), 210)
-        self.assertEqual(move.partner_id.softlife_payout_tenant_id, payload['bill']['tenant_id'])
-        self.assertTrue(move.partner_id.softlife_payout_vendor_sha256)
+        self.assertEqual(move.partner_id.supabase_id, payload['bill']['tenant_id'])
+        self.assertEqual(move.invoice_date.isoformat(), '2026-10-01')
+        self.assertEqual(move.invoice_date_due.isoformat(), '2026-10-15')
+        self.assertFalse(move.invoice_payment_term_id)
         self.assertEqual(move.softlife_payout_recipient_snapshot['tax_id'], company.vat)
 
-    def test_rejects_non_month_end_and_tax_added_math(self):
-        company, journal, product, tax, payload, payload_hash = \
+    def test_rejects_wrong_invoice_date_and_incorrect_tax_math(self):
+        company, journal, account, tax, payload, payload_hash = \
             self._configuration_and_payload()
-        payload['bill']['invoice_date'] = '2026-09-29'
+        payload['bill']['invoice_date'] = '2026-09-30'
         with self.assertRaisesRegex(SoftlifeAPIError, 'values are invalid'):
             self.client._validate_payout_draft_payload(payload, self._hash(payload))
-        payload['bill']['invoice_date'] = '2026-09-30'
+        payload['bill']['invoice_date'] = '2026-10-01'
         payload['bill'].update({'gross_cents': 1210, 'tax_base_cents': 1210, 'iva_cents': 254})
-        with self.assertRaisesRegex(SoftlifeAPIError, 'gross-inclusive IVA'):
+        with self.assertRaisesRegex(SoftlifeAPIError, 'tax-base IVA'):
             self.client._validate_payout_draft_payload(payload, self._hash(payload))
 
     def test_draft_is_frozen_and_manual_post_is_blocked(self):
-        company, journal, product, tax, payload, payload_hash, result = self._draft()
+        company, journal, account, tax, payload, payload_hash, result = self._draft()
         move = self.env['account.move'].browse(result['bill']['odoo_move_id'])
         with self.assertRaisesRegex(UserError, 'headers are frozen'):
             move.write({'ref': 'Manual change'})
+        with self.assertRaisesRegex(UserError, 'headers are frozen'):
+            move.write({'invoice_date_due': '2026-10-16'})
         with self.assertRaisesRegex(UserError, 'lines are frozen'):
             move.invoice_line_ids.write({'name': 'Manual change'})
         with self.assertRaisesRegex(UserError, 'validated payout handler'):
             move.action_post()
 
     def test_posts_once_and_retries_idempotently(self):
-        company, journal, product, tax, payload, payload_hash, draft = self._draft()
+        company, journal, account, tax, payload, payload_hash, draft = self._draft()
         posting = {'schema_version': 1, 'bill': {
             'platform_bill_id': payload['bill']['platform_bill_id'],
             'odoo_move_id': draft['bill']['odoo_move_id'],
@@ -175,12 +213,15 @@ class TestPayoutSelfBilling(TransactionCase):
         self.assertFalse(second['bill']['posted'])
         self.assertEqual(first['bill']['state'], 'posted')
         self.assertTrue(first['bill']['name'])
+        move = self.env['account.move'].browse(draft['bill']['odoo_move_id'])
+        self.assertEqual(move.journal_id.code, 'AFRS')
+        self.assertEqual(move.invoice_date_due.isoformat(), '2026-10-15')
         self.assertEqual(set(first['bill']), {
             'platform_bill_id', 'odoo_move_id', 'payload_sha256', 'state', 'name', 'posted',
         })
 
     def test_pdf_upload_is_raw_and_attachment_is_reused(self):
-        company, journal, product, tax, payload, payload_hash, draft = self._draft()
+        company, journal, account, tax, payload, payload_hash, draft = self._draft()
         move = self.env['account.move'].browse(draft['bill']['odoo_move_id'])
         Client = type(self.client)
         with patch.object(Client, '_payout_enabled', return_value=True), \
@@ -194,6 +235,9 @@ class TestPayoutSelfBilling(TransactionCase):
             'odoo_move_id': move.id, 'payload_sha256': payload_hash,
             'odoo_name': posted['bill']['name'],
         }}
+        self.assertEqual(
+            self.client._payout_invoice_report(), self.env.ref('account.account_invoices')
+        )
         report = Mock(report_name='account.report_invoice')
         report._render_qweb_pdf.return_value = (b'%PDF-1.7\nself-bill', 'pdf')
         request = {'id': str(uuid.uuid4()), 'claim_token': str(uuid.uuid4())}
@@ -223,14 +267,12 @@ class TestPayoutSelfBilling(TransactionCase):
             with self.assertRaisesRegex(SoftlifeAPIError, 'PDF export is disabled'):
                 self.client._export_payout_vendor_bill_pdf({}, {})
 
-    def test_settings_require_all_dedicated_payout_configuration(self):
-        params = self.env['ir.config_parameter'].sudo()
-        for name in (
-                'payout_company_id', 'payout_purchase_journal_id',
-                'payout_expense_product_id', 'payout_purchase_tax_id'):
-            params.set_param(f'softlife.sync.{name}', '')
+    def test_settings_require_existing_afrs_configuration(self):
         settings = self.env['res.config.settings'].create({
             'softlife_payout_bill_draft_creation_enabled': True,
         })
-        with self.assertRaisesRegex(UserError, 'Select the payout company'):
-            settings.set_values()
+        Client = type(self.client)
+        with patch.object(Client, '_payout_configuration', side_effect=SoftlifeAPIError(
+                'Odoo must contain exactly one active AFRS purchase journal.')):
+            with self.assertRaisesRegex(UserError, 'AFRS purchase journal'):
+                settings.set_values()
