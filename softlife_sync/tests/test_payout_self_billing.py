@@ -69,28 +69,13 @@ class TestPayoutSelfBilling(TransactionCase):
         self.env['ir.config_parameter'].sudo().set_param(
             'softlife.sync.fiscal_company_id', company.id
         )
-        source_taxes = self.env['account.tax'].with_company(company).search([
-            ('company_id', '=', company.id), ('country_id', '=', country.id),
-            ('active', '=', True), ('tax_exigibility', '=', 'on_invoice'),
-            ('type_tax_use', '=', 'purchase'), ('amount_type', '=', 'percent'),
-            ('amount', '=', 21),
-        ]).filtered(lambda candidate: (
-            any(line.tag_ids for line in candidate.invoice_repartition_line_ids.filtered(
-                lambda row: row.repartition_type == 'base'))
-            and all(line.account_id and line.account_id.account_type == 'asset_current'
-                    for line in candidate.invoice_repartition_line_ids.filtered(
-                        lambda row: row.repartition_type == 'tax'))
-            and any(line.tag_ids for line in candidate.invoice_repartition_line_ids.filtered(
-                lambda row: row.repartition_type == 'tax'))
-        ))
-        if not source_taxes:
-            self.skipTest('Test company has no fully configured Spanish 21% purchase IVA tax.')
-        source_taxes.filtered(lambda candidate: not candidate.price_include).write({'active': False})
-        tax = source_taxes[:1].copy({
-            'name': 'SoftLife payout IVA excluido 21%',
-            'price_include_override': 'tax_excluded',
-            'active': True,
-        })
+        tax = self.env.ref(
+            f'account.{company.id}_account_tax_template_p_iva21_sc',
+            raise_if_not_found=False,
+        )
+        if not tax:
+            self.skipTest('Test company has no standard Spanish domestic 21% service purchase tax.')
+        tax.write({'price_include_override': 'tax_excluded', 'active': True})
         bill = {
             'platform_bill_id': str(uuid.uuid4()),
             'settlement_id': str(uuid.uuid4()),
@@ -137,6 +122,16 @@ class TestPayoutSelfBilling(TransactionCase):
                 patch.object(Client, '_assert_payout_date_unlocked'):
             result = self.client._create_payout_vendor_bill_draft(records[4], records[5])
         return (*records, result)
+
+    def test_configuration_uses_standard_domestic_service_tax(self):
+        company, _journal, _account, tax, _payload, _payload_hash = \
+            self._configuration_and_payload()
+        tax.copy({'name': 'Another excluded 21% purchase tax', 'active': True})
+
+        configured = self.client._payout_configuration()
+
+        self.assertEqual(configured[0], company)
+        self.assertEqual(configured[3], tax)
 
     def test_creates_exact_draft_and_reuses_it(self):
         company, journal, account, tax, payload, payload_hash = \

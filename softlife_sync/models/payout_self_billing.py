@@ -133,25 +133,16 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
                 'Odoo must contain exactly one expense account 623100 for the AFRS company.'
             ))
         account = accounts
-        tax_candidates = self.env['account.tax'].sudo().with_company(company).with_context(
-            active_test=False, allowed_company_ids=[company.id]
-        ).search([
-            ('company_id', '=', company.id), ('active', '=', True),
-            ('type_tax_use', '=', 'purchase'), ('amount_type', '=', 'percent'),
-            ('amount', '=', 21), ('country_id', '=', company.account_fiscal_country_id.id),
-            ('tax_exigibility', '=', 'on_invoice'),
-        ]).filtered(lambda candidate: not candidate.price_include)
-        taxes_used = self.env['account.move'].sudo().search([
-            ('journal_id', '=', journal.id), ('move_type', '=', 'in_invoice'),
-            ('state', 'in', ('draft', 'posted')),
-        ]).invoice_line_ids.filtered(
-            lambda line: line.display_type == 'product' and line.account_id == account
-        ).tax_ids & tax_candidates
-        tax = taxes_used if len(taxes_used) == 1 else tax_candidates
-        if len(tax) != 1:
+        tax = self.env.ref(
+            f'account.{company.id}_account_tax_template_p_iva21_sc',
+            raise_if_not_found=False,
+        )
+        if not tax or tax._name != 'account.tax':
             self._payout_error(_(
-                'Odoo must identify exactly one excluded 21% purchase IVA tax for AFRS bills.'
+                'The standard Spanish domestic 21% service purchase tax (21% S) is missing '
+                'for the AFRS company.'
             ))
+        tax = tax.sudo().with_company(company)
         repartition = tax.invoice_repartition_line_ids
         base_repartition = repartition.filtered(lambda line: line.repartition_type == 'base')
         tax_repartition = repartition.filtered(lambda line: line.repartition_type == 'tax')
@@ -175,12 +166,15 @@ class SoftlifePayoutSelfBilling(models.TransientModel):
             or not tax.active or tax.company_id != company
             or tax.type_tax_use != 'purchase' or tax.amount_type != 'percent'
             or tax.amount != 21 or tax.price_include
+            or tax.tax_scope != 'service'
+            or tax.l10n_es_type != 'sujeto' or tax.l10n_es_bien_inversion
             or tax.country_id != company.account_fiscal_country_id
             or tax.tax_exigibility != 'on_invoice' or not valid_repartition
         ):
             self._payout_error(_(
                 'The AFRS journal must use a Spanish EUR company, an unrestricted active account '
-                '623100, and a valid excluded 21% purchase IVA tax.'
+                '623100, and the standard excluded Spanish domestic 21% service purchase tax '
+                '(21% S).'
             ))
         return company, journal, account, tax
 
